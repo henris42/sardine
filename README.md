@@ -5,6 +5,11 @@ debug-prints out of the box — one header, no macros, no codegen, driven by
 reflection (P2996), `template for` (P1306) and annotations (P3394).
 Cookbook in [examples.md](examples.md).
 
+Live on Compiler Explorer: <https://godbolt.org/z/E7Ea44ojT> — static_asserts
+prove the compile-time name resolution, the Execution pane runs the roundtrip
+checks, and the asm pane shows the reflection folds away entirely (flat
+string appends of `.rodata` literals; zero runtime metadata).
+
 ```cpp
 struct User {
   [[=sardine::rename("user_id")]] int id = 0;
