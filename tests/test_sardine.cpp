@@ -361,6 +361,29 @@ static void test_views_and_fixed_strings() {
          back->rows[1].name == "Button" && back->rows[1].addr == 11);
 }
 
+static void test_schema() {
+  // annotations honored: rename, skip, required-per-level, unknown-fields policy
+  EXPECT_EQ(sardine::schema<User>(),
+            R"({"type":"object","title":"User","properties":{)"
+            R"("user_id":{"type":"integer"},"name":{"type":"string"},)"
+            R"("balance":{"type":"number"},"active":{"type":"boolean"}},)"
+            R"("required":[],"additionalProperties":true})");
+  // enums list their serialized names; optionals admit null; sequences nest
+  struct Reading {
+    [[=sardine::required{}]] std::string sensor;
+    std::optional<double> value;
+    std::vector<int> raw;
+  };
+  EXPECT_EQ(sardine::schema<Reading>(),
+            R"({"type":"object","title":"Reading","properties":{)"
+            R"("sensor":{"type":"string"},)"
+            R"("value":{"anyOf":[{"type":"number"},{"type":"null"}]},)"
+            R"("raw":{"type":"array","items":{"type":"integer"}}},)"
+            R"("required":["sensor"],"additionalProperties":true})");
+  enum class Mode { idle, running };
+  EXPECT_EQ(sardine::schema<Mode>(), R"({"enum":["idle","running"]})");
+}
+
 static void test_errors() {
   EXPECT(!sardine::from_json<User>(R"({"user_id": )").has_value());
   EXPECT(!sardine::from_json<User>(R"([1,2])").has_value());
@@ -389,6 +412,7 @@ int main() {
   test_directional_skips();
   test_string_escapes();
   test_views_and_fixed_strings();
+  test_schema();
   test_errors();
 
   if (failures == 0) std::println("all tests passed");

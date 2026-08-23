@@ -44,6 +44,7 @@ make test
 | fieldless enums | enum class ↔ `"enumerator_name"` |
 | `to_string_pretty` | `sardine::to_json_pretty(v, indent = 2)` |
 | `Debug`, `{:?}` / `{:#?}` | `sardine::dbg(v)` with `{}` / `{:#}` |
+| schemars `schema_for!` | `sardine::schema<T>()` — JSON Schema of the serialized form |
 
 Types: bool, integers, floats, `std::string`, `optional`, `variant`,
 `monostate`, sequences, maps (string or integer keys), nested structs, enums.

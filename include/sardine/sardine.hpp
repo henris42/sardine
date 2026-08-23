@@ -1033,6 +1033,137 @@ struct debug_writer {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Schema generation ("meta class"): describe a type's SERIALIZED form as a
+// JSON Schema document. The description honors the same annotations the
+// writer does (rename / rename_all / skip / required / deny_unknown_fields /
+// flatten), so schema<T>() is always true of to_json<T>()'s output. An
+// endpoint can hand its schema to any peer -- the WSDL/IDL role, generated
+// from the type instead of maintained beside it.
+// ---------------------------------------------------------------------------
+
+struct schema_writer {
+  std::string out;
+
+  void lit(std::string_view s) { out += s; }
+  void key(std::string_view k) { escape_into(out, k); out += ':'; }
+
+  template <typename T>
+  void type_schema() {
+    if constexpr (std::same_as<T, bool>) {
+      lit(R"({"type":"boolean"})");
+    } else if constexpr (std::is_enum_v<T>) {
+      lit(R"({"enum":[)");
+      bool first = true;
+      template for (constexpr auto e : enumerators_of<T>()) {
+        if (!std::exchange(first, false)) out += ',';
+        escape_into(out, json_name<T>(e));
+      }
+      lit("]}");
+    } else if constexpr (std::integral<T>) {
+      lit(R"({"type":"integer"})");
+    } else if constexpr (std::floating_point<T>) {
+      lit(R"({"type":"number"})");
+    } else if constexpr (string_like<T>) {
+      lit(R"({"type":"string"})");
+    } else if constexpr (is_optional<T>::value) {
+      lit(R"({"anyOf":[)");
+      type_schema<typename T::value_type>();
+      lit(R"(,{"type":"null"}]})");
+    } else if constexpr (std::same_as<T, std::monostate>) {
+      lit(R"({"type":"null"})");
+    } else if constexpr (is_variant<T>::value) {
+      variant_schema<T>();
+    } else if constexpr (map_like<T>) {
+      lit(R"({"type":"object","additionalProperties":)");
+      type_schema<typename T::mapped_type>();
+      lit("}");
+    } else if constexpr (sequence_like<T>) {
+      lit(R"({"type":"array","items":)");
+      type_schema<std::ranges::range_value_t<T>>();
+      lit("}");
+    } else if constexpr (reflectable_struct<T>) {
+      struct_schema<T>();
+    } else {
+      static_assert(false, "sardine: type has no schema");
+    }
+  }
+
+  // Externally tagged (the type-level default): a unit (monostate) alternative
+  // is the bare string "AltName"; others are {"AltName": <value>}.
+  template <typename V>
+  void variant_schema() {
+    lit(R"({"oneOf":[)");
+    bool first = true;
+    template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+      if (!std::exchange(first, false)) out += ',';
+      using A = std::variant_alternative_t<I, V>;
+      if constexpr (std::same_as<A, std::monostate>) {
+        lit(R"({"const":)");
+        escape_into(out, alt_name<V, I>());
+        lit("}");
+      } else {
+        lit(R"({"type":"object","properties":{)");
+        key(alt_name<V, I>());
+        type_schema<A>();
+        lit(R"(},"required":[)");
+        escape_into(out, alt_name<V, I>());
+        lit(R"(],"additionalProperties":false})");
+      }
+    }
+    lit("]}");
+  }
+
+  template <typename T>
+  void struct_schema() {
+    lit(R"({"type":"object","title":)");
+    escape_into(out, type_name<T>());
+    lit(R"(,"properties":{)");
+    bool first = true;
+    properties_of<T>(first);
+    lit(R"(},"required":[)");
+    bool rfirst = true;
+    required_of<T>(rfirst);
+    lit(R"(],"additionalProperties":)");
+    // Fidelity with the parser: unknown keys error only under
+    // deny_unknown_fields; a flattened catch-all map also accepts anything.
+    lit(has<deny_unknown_fields>(^^T) ? "false" : "true");
+    lit("}");
+  }
+
+  // Emit properties, hoisting flattened structs like the writer does; a
+  // flattened map is the catch-all and contributes no fixed properties.
+  template <typename T>
+  void properties_of(bool& first) {
+    template for (constexpr auto m : members_of<T>()) {
+      if constexpr (!skip_ser(m)) {
+        using M = [:std::meta::type_of(m):];
+        if constexpr (has<flatten>(m) && reflectable_struct<M>) {
+          properties_of<M>(first);
+        } else if constexpr (has<flatten>(m) && map_like<M>) {
+          // catch-all: covered by additionalProperties
+        } else {
+          if (!std::exchange(first, false)) out += ',';
+          key(json_name<T>(m));
+          type_schema<M>();
+        }
+      }
+    }
+  }
+
+  // required{} is per-level and not tracked through flatten (see README
+  // deviations) -- the schema states exactly what the parser enforces.
+  template <typename T>
+  void required_of(bool& first) {
+    template for (constexpr auto m : members_of<T>()) {
+      if constexpr (!skip_de(m) && has<required>(m)) {
+        if (!std::exchange(first, false)) out += ',';
+        escape_into(out, json_name<T>(m));
+      }
+    }
+  }
+};
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1198,17 @@ std::expected<T, error> from_json(std::string_view json) {
     return std::unexpected(error{e.message, e.offset});
   }
   return value;
+}
+
+// JSON Schema of T's serialized form ("meta class"): what to_json<T> emits
+// and from_json<T> accepts, annotations honored. Validates anywhere JSON
+// Schema does; serves as the machine-readable protocol description an
+// endpoint can hand to its peers.
+template <typename T>
+std::string schema() {
+  detail::schema_writer w;
+  w.template type_schema<T>();
+  return std::move(w.out);
 }
 
 // Rust's {:?}
