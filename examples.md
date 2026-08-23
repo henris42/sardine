@@ -185,6 +185,36 @@ std::map<int, std::string> m{{1, "a"}, {2, "b"}};
 sardine::to_json(m);   // {"1":"a","2":"b"}
 ```
 
+## 8b. Exporting constexpr tables (spans, custom string types)
+
+Serialization is read-only, so it works on **views** — `std::span` over
+`constexpr` arrays serializes without copying. And any type convertible to
+`std::string_view` serializes as a JSON string, so a compile-time fixed
+string needs one conversion operator, not an adapter:
+
+```cpp
+template <std::size_t N> struct FixedString {
+  char data[N]{}; std::size_t len{};
+  // ...
+  constexpr operator std::string_view() const { return {data, len}; }  // <-- enough
+};
+
+struct Row  { FixedString<16> name; std::uint32_t addr; };
+inline constexpr Row kRows[] = { {"LedRed", 13}, {"Button", 11} };
+
+struct Export { std::span<const Row> rows; };
+sardine::to_json_pretty(Export{kRows});
+// {"rows":[{"name":"LedRed","addr":13},{"name":"Button","addr":11}]}
+```
+
+This is how an embedded project whose configuration lives in `constexpr`
+tables (e.g. [firn](https://github.com/henris42/firn)) emits its topology as
+JSON for host tooling: the firmware's compile-time data is the single source
+of truth; the JSON is generated *from* it. The host side re-imports with the
+same header into `std::string`/`std::vector` mirror structs — deserialization
+targets owning types (`std::string`, containers with `emplace_back`), views
+and fixed strings are serialize-only.
+
 ## 9. Pretty printing
 
 ```cpp

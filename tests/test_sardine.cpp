@@ -2,6 +2,7 @@
 
 #include <map>
 #include <print>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -135,7 +136,7 @@ static void test_pretty_json() {
   EXPECT_EQ(sardine::to_json_pretty(std::vector<int>{5}, 4), "[\n    5\n]");
 
   // pretty output parses back
-  Outer o{.inner = {.values = {3}, .note = "n"}, .scores = {{"a", 1}}};
+  Outer o{.inner = {.values = {3}, .note = "n"}, .scores = {{"a", 1}}, .history = {}};
   auto back = sardine::from_json<Outer>(sardine::to_json_pretty(o));
   EXPECT(back.has_value());
   EXPECT((back->inner.values == std::vector{3}));
@@ -333,6 +334,33 @@ static void test_string_escapes() {
   EXPECT(p.has_value() && *p == "pizza \U0001F355 é");
 }
 
+// Serialization is read-only: spans over constexpr tables serialize without
+// copying, and any type convertible to string_view serializes as a string
+// (the constexpr-table-export pattern, examples.md §8b).
+template <std::size_t N>
+struct MiniFixed {
+  char data[N]{};
+  std::size_t len{};
+  constexpr MiniFixed(const char* s) { while (s[len] && len < N - 1) { data[len] = s[len]; ++len; } }
+  constexpr operator std::string_view() const { return {data, len}; }
+};
+struct TableRow { MiniFixed<16> name; std::uint32_t addr; };
+inline constexpr TableRow kTable[] = { {"LedRed", 13}, {"Button", 11} };
+
+static void test_views_and_fixed_strings() {
+  struct Export { std::span<const TableRow> rows; };
+  EXPECT_EQ(sardine::to_json(Export{kTable}),
+            R"({"rows":[{"name":"LedRed","addr":13},{"name":"Button","addr":11}]})");
+  // debug printing agrees that it's a string, not a struct
+  EXPECT_EQ(sardine::debug(kTable[0]), R"(TableRow { name: "LedRed", addr: 13 })");
+  // and the export round-trips into owning host-side mirrors
+  struct HostRow { std::string name; std::uint32_t addr = 0; };
+  struct HostExport { std::vector<HostRow> rows; };
+  auto back = sardine::from_json<HostExport>(sardine::to_json(Export{kTable}));
+  EXPECT(back.has_value() && back->rows.size() == 2 &&
+         back->rows[1].name == "Button" && back->rows[1].addr == 11);
+}
+
 static void test_errors() {
   EXPECT(!sardine::from_json<User>(R"({"user_id": )").has_value());
   EXPECT(!sardine::from_json<User>(R"([1,2])").has_value());
@@ -360,6 +388,7 @@ int main() {
   test_unknown_and_missing_fields();
   test_directional_skips();
   test_string_escapes();
+  test_views_and_fixed_strings();
   test_errors();
 
   if (failures == 0) std::println("all tests passed");
