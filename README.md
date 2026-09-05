@@ -1,7 +1,7 @@
 # sardine
 
-Serde for C++26: JSON, debug-printing and schemas for any struct or enum,
-out of the box. One header, no macros, no codegen — just reflection.
+Serde for C++26: JSON, CBOR, debug-printing and schemas for any struct or
+enum, out of the box. One header, no macros, no codegen — just reflection.
 
 ```cpp
 struct User {
@@ -14,6 +14,7 @@ struct User {
 User u{.id = 7, .name = "Henri", .balance = 12.5};
 std::string j = sardine::to_json(u);          // {"user_id":7,"name":"Henri","balance":12.5}
 std::expected<User, sardine::error> back = sardine::from_json<User>(j);
+std::vector<std::uint8_t> c = sardine::to_cbor(u);  // same model, binary (RFC 8949)
 std::println("{:#}", sardine::dbg(u));        // Rust {:#?}-style debug print
 ```
 

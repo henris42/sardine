@@ -16,6 +16,7 @@
 | `Option<T>` | `std::optional<T>` ↔ null |
 | fieldless enums | enum class ↔ `"enumerator_name"` |
 | `to_string_pretty` | `sardine::to_json_pretty(v, indent = 2)` |
+| `serde_cbor` / `ciborium` | `sardine::to_cbor(v)` / `from_cbor<T>` — same annotations |
 | `Debug`, `{:?}` / `{:#?}` | `sardine::dbg(v)` with `{}` / `{:#}` |
 | schemars `schema_for!` | `sardine::schema<T>()` — JSON Schema of the serialized form |
 
@@ -24,6 +25,21 @@ Types: bool, integers, floats, `std::string`, `optional`, `variant`,
 Parser handles `\uXXXX` escapes incl. surrogate pairs; nesting-depth guard.
 Field names resolve at compile time and live in static storage
 (`std::define_static_string`) — runtime never computes names.
+
+## CBOR (RFC 8949)
+
+`to_cbor`/`from_cbor<T>` share the JSON data model and annotations: structs
+are maps with text keys, enums and variant tags are text strings. Format
+differences: integer map keys stay integers, nan/inf encode natively (JSON
+degrades them to null), floats encode at their static width (`float` → 4
+bytes, `double` → 8; no shortest-float search). The encoder emits definite
+lengths and minimal-width heads (unsized input ranges fall back to indefinite
+arrays); map/field order follows declaration/container order, so output is
+not RFC deterministic encoding. The decoder additionally accepts
+indefinite-length strings/arrays/maps, half-precision floats, integers where
+a float is expected, text-encoded integer map keys, and skips semantic tags
+(major 6). Byte strings (major 2) are never produced and skip as unknown
+fields but are not readable values.
 
 ## GCC 16.1 notes
 

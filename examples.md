@@ -236,6 +236,32 @@ flattened structs are hoisted, and `additionalProperties` reflects
 endpoint hands to its peers — the IDL/WSDL role, generated from the type
 instead of maintained beside it.
 
+## 8d. CBOR
+
+`to_cbor` / `from_cbor<T>` (RFC 8949) are the binary twin of the JSON pair:
+same data model, same annotations, byte-for-byte smaller and faster to parse.
+Structs are CBOR maps with text keys; enums and variant tags are text strings,
+so the two formats stay mutually convertible:
+
+```cpp
+std::vector<std::uint8_t> c = sardine::to_cbor(user);
+std::expected<User, sardine::error> back = sardine::from_cbor<User>(c);
+```
+
+Where the formats differ, CBOR keeps what JSON has to throw away:
+
+```cpp
+std::map<int, std::string> m{{1, "a"}};
+sardine::to_cbor(m);        // a1 01 61 61 — integer keys stay integers
+sardine::to_json(m);        // {"1":"a"}   — JSON must stringify them
+sardine::to_cbor(0.0 / 0.0);  // NaN encodes natively (JSON degrades it to null)
+```
+
+The decoder is liberal per the RFC: indefinite-length strings/arrays/maps,
+half/single/double floats, integers where a float is expected, text-encoded
+integer map keys (JSON-converted documents), and semantic tags are all
+accepted; the encoder always emits definite lengths and minimal-width heads.
+
 ## 9. Pretty printing
 
 ```cpp

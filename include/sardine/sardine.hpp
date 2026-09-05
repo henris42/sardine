@@ -13,6 +13,9 @@
 //   std::string jp = sardine::to_json_pretty(u);
 //   std::expected<User, sardine::error> u2 = sardine::from_json<User>(j);
 //
+//   std::vector<std::uint8_t> c = sardine::to_cbor(u);           // RFC 8949
+//   std::expected<User, sardine::error> u3 = sardine::from_cbor<User>(c);
+//
 //   std::println("{}",  sardine::dbg(u));   // Rust {:?}  : User { id: 7, ... }
 //   std::println("{:#}", sardine::dbg(u));  // Rust {:#?} : multi-line
 //
@@ -21,18 +24,23 @@
 
 #include <meta>
 #include <array>
+#include <bit>
 #include <charconv>
+#include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <limits>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace sardine {
 
@@ -118,7 +126,7 @@ struct rename_all {
 
 struct error {
   std::string message;
-  std::size_t offset = 0;  // byte offset into the input JSON
+  std::size_t offset = 0;  // byte offset into the input (JSON text or CBOR)
 };
 
 // ---------------------------------------------------------------------------
@@ -683,8 +691,10 @@ void read_variant_external(parser& p, V& out) {
   p.expect('}');
 }
 
-template <typename V>
-void read_variant_untagged(parser& p, V& out) {
+// Shared between the JSON and CBOR readers: both expose pos/fail and throw
+// parse_error, which is all the retry loop needs.
+template <typename P, typename V>
+void read_variant_untagged(P& p, V& out) {
   std::size_t save = p.pos;
   bool matched = false;
   template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
@@ -744,9 +754,11 @@ void read_variant_internal(parser& p, V& out, std::string_view tag_key) {
   if (!matched) p.fail("unknown variant tag value");
 }
 
-// Field read with member-annotation-driven variant modes.
-template <std::meta::info M, typename F>
-void read_member(parser& p, F& field) {
+// Field read with member-annotation-driven variant modes. Templated on the
+// reader so the JSON and CBOR parsers share it; the variant readers resolve
+// to the overload matching `p`.
+template <std::meta::info M, typename P, typename F>
+void read_member(P& p, F& field) {
   if constexpr (is_variant<F>::value) {
     if constexpr (has<untagged>(M)) {
       read_variant_untagged(p, field);
@@ -767,8 +779,9 @@ void read_member(parser& p, F& field) {
 // Route one "key": value pair into `out`. Direct fields first, then fields of
 // flattened structs (recursively), then a flattened catch-all map if present.
 // `seen` (when non-null) tracks which of this level's direct members matched.
-template <typename T>
-bool try_read_key(parser& p, T& out, std::string_view key, bool* seen) {
+// Format-independent: works for any reader `p` that read_member accepts.
+template <typename P, typename T>
+bool try_read_key(P& p, T& out, std::string_view key, bool* seen) {
   constexpr auto mems = members_of<T>();
   bool handled = false;
   template for (constexpr auto I : indices<mems.size()>()) {
@@ -804,9 +817,25 @@ bool try_read_key(parser& p, T& out, std::string_view key, bool* seen) {
   return handled;
 }
 
+// Fail if any required member of T went unseen. Shared by both readers.
+template <typename T, typename P>
+void check_required(P& p, const bool* seen) {
+  constexpr auto mems = members_of<T>();
+  template for (constexpr auto I : indices<mems.size()>()) {
+    constexpr auto m = mems[I];
+    if constexpr (has<required>(m)) {
+      if (!seen[I]) {
+        constexpr const char* msg = std::define_static_string(
+            std::string("missing required field '") +
+            std::string(json_name<T>(m)) + "'");
+        p.fail(msg);
+      }
+    }
+  }
+}
+
 template <typename T>
 void read_struct(parser& p, T& out) {
-  constexpr auto mems = members_of<T>();
   std::array<bool, members_of<T>().size()> seen{};
   parser::depth_guard g(p);
   p.expect('{');
@@ -821,17 +850,7 @@ void read_struct(parser& p, T& out) {
     } while (p.consume(','));
     p.expect('}');
   }
-  template for (constexpr auto I : indices<mems.size()>()) {
-    constexpr auto m = mems[I];
-    if constexpr (has<required>(m)) {
-      if (!seen[I]) {
-        constexpr const char* msg = std::define_static_string(
-            std::string("missing required field '") +
-            std::string(json_name<T>(m)) + "'");
-        p.fail(msg);
-      }
-    }
-  }
+  check_required<T>(p, seen.data());
 }
 
 template <typename T>
@@ -899,6 +918,555 @@ void read_value(parser& p, T& out) {
     if (p.consume(']')) return;
     do read_value(p, out.emplace_back()); while (p.consume(','));
     p.expect(']');
+  } else if constexpr (reflectable_struct<T>) {
+    read_struct(p, out);
+  } else {
+    static_assert(false, "sardine: type is not deserializable");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CBOR serialization (RFC 8949). Same data model and annotations as the JSON
+// pair; the differences are the ones the format invites: integer map keys
+// stay integers, nan/inf encode natively, and output is definite-length
+// throughout (except unsized input ranges, which use indefinite arrays).
+// ---------------------------------------------------------------------------
+
+struct cbor_writer {
+  std::vector<std::uint8_t> out;
+
+  void byte(std::uint8_t b) { out.push_back(b); }
+  void be(std::uint64_t v, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) byte(std::uint8_t(v >> (8 * i)));
+  }
+  // Major type + minimal-length argument encoding.
+  void head(std::uint8_t major, std::uint64_t v) {
+    std::uint8_t m = std::uint8_t(major << 5);
+    if (v < 24) byte(m | std::uint8_t(v));
+    else if (v <= 0xff) { byte(m | 24); be(v, 1); }
+    else if (v <= 0xffff) { byte(m | 25); be(v, 2); }
+    else if (v <= 0xffffffff) { byte(m | 26); be(v, 4); }
+    else { byte(m | 27); be(v, 8); }
+  }
+  void text(std::string_view s) {
+    head(3, s.size());
+    out.insert(out.end(), s.begin(), s.end());
+  }
+  template <typename T>
+  void integer(T v) {
+    auto u = static_cast<std::uint64_t>(v);
+    if constexpr (std::signed_integral<T>) {
+      if (v < 0) { head(1, ~u); return; }  // ~u == -1 - v in unsigned math
+    }
+    head(0, u);
+  }
+  void null() { byte(0xf6); }
+
+  template <typename K>
+  void key(const K& k) {
+    if constexpr (string_like<K>) text(std::string_view(k));
+    else integer(k);  // CBOR map keys need not be strings
+  }
+
+  template <typename T>
+  void write(const T& v) {
+    if constexpr (std::same_as<T, bool>) {
+      byte(v ? 0xf5 : 0xf4);
+    } else if constexpr (std::is_enum_v<T>) {
+      template for (constexpr auto e : enumerators_of<T>()) {
+        if (v == [:e:]) {
+          text(json_name<T>(e));
+          return;
+        }
+      }
+      integer(std::to_underlying(v));  // value outside named enumerators
+    } else if constexpr (std::integral<T>) {
+      integer(v);
+    } else if constexpr (std::same_as<T, float>) {
+      byte(0xfa);
+      be(std::bit_cast<std::uint32_t>(v), 4);
+    } else if constexpr (std::floating_point<T>) {
+      byte(0xfb);
+      be(std::bit_cast<std::uint64_t>(double(v)), 8);
+    } else if constexpr (string_like<T>) {
+      text(std::string_view(v));
+    } else if constexpr (is_optional<T>::value) {
+      if (v) write(*v);
+      else null();
+    } else if constexpr (std::same_as<T, std::monostate>) {
+      null();
+    } else if constexpr (is_variant<T>::value) {
+      variant_external(v);
+    } else if constexpr (map_like<T>) {
+      head(5, std::uint64_t(std::ranges::distance(v)));
+      for (const auto& [k, mv] : v) {
+        key(k);
+        write(mv);
+      }
+    } else if constexpr (sequence_like<T>) {
+      if constexpr (std::ranges::forward_range<T>) {
+        head(4, std::uint64_t(std::ranges::distance(v)));
+        for (const auto& e : v) write(e);
+      } else {  // single-pass range: length unknown up front
+        byte(0x9f);
+        for (const auto& e : v) write(e);
+        byte(0xff);
+      }
+    } else if constexpr (reflectable_struct<T>) {
+      head(5, field_count(v));
+      struct_body(v);
+    } else {
+      static_assert(false, "sardine: type is not serializable");
+    }
+  }
+
+  // Number of key/value pairs `v` contributes — its own fields plus, through
+  // flatten, its children's (structs recurse, catch-all maps count entries).
+  template <typename T>
+  std::uint64_t field_count(const T& v) {
+    std::uint64_t n = 0;
+    template for (constexpr auto m : members_of<T>()) {
+      if constexpr (!skip_ser(m)) {
+        using M = [:std::meta::type_of(m):];
+        if constexpr (has<flatten>(m) && reflectable_struct<M>) {
+          n += field_count(v.[:m:]);
+        } else if constexpr (has<flatten>(m) && map_like<M>) {
+          n += std::uint64_t(std::ranges::distance(v.[:m:]));
+        } else {
+          ++n;
+        }
+      }
+    }
+    return n;
+  }
+
+  // Emits the pairs of `v` without the map head (used by flatten and
+  // internally tagged variants).
+  template <typename T>
+  void struct_body(const T& v) {
+    template for (constexpr auto m : members_of<T>()) {
+      if constexpr (!skip_ser(m)) {
+        using M = [:std::meta::type_of(m):];
+        if constexpr (has<flatten>(m) && reflectable_struct<M>) {
+          struct_body(v.[:m:]);
+        } else if constexpr (has<flatten>(m) && map_like<M>) {
+          for (const auto& [k, mv] : v.[:m:]) {
+            key(k);
+            write(mv);
+          }
+        } else {
+          text(json_name<T>(m));
+          write_member<m>(v.[:m:]);
+        }
+      }
+    }
+  }
+
+  // Field write with member-annotation-driven variant modes.
+  template <std::meta::info M, typename F>
+  void write_member(const F& field) {
+    if constexpr (is_variant<F>::value) {
+      if constexpr (has<untagged>(M)) {
+        variant_untagged(field);
+      } else if constexpr (annotation_of<tag>(M).has_value()) {
+        constexpr auto tg = annotation_of<tag>(M);
+        constexpr std::string_view tn{std::define_static_string(tg->str())};
+        variant_internal(field, tn);
+      } else {
+        variant_external(field);
+      }
+    } else {
+      write(field);
+    }
+  }
+
+  // {"AltName": value} as a one-entry map; unit (monostate) alternatives
+  // collapse to the text string "AltName".
+  template <typename V>
+  void variant_external(const V& v) {
+    template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+      if (v.index() == I) {
+        using A = std::variant_alternative_t<I, V>;
+        if constexpr (std::same_as<A, std::monostate>) {
+          text(alt_name<V, I>());
+        } else {
+          head(5, 1);
+          text(alt_name<V, I>());
+          write(std::get<I>(v));
+        }
+        return;
+      }
+    }
+    null();  // valueless_by_exception
+  }
+
+  template <typename V>
+  void variant_untagged(const V& v) {
+    template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+      if (v.index() == I) {
+        write(std::get<I>(v));
+        return;
+      }
+    }
+    null();
+  }
+
+  // {<tag>: "AltName", ...alt fields} — alternatives must all be structs.
+  template <typename V>
+  void variant_internal(const V& v, std::string_view tag_key) {
+    template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+      if (v.index() == I) {
+        using A = std::variant_alternative_t<I, V>;
+        static_assert(reflectable_struct<A>,
+                      "sardine::tag requires all variant alternatives to be structs");
+        head(5, 1 + field_count(std::get<I>(v)));
+        text(tag_key);
+        text(alt_name<V, I>());
+        struct_body(std::get<I>(v));
+        return;
+      }
+    }
+    null();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// CBOR deserialization. Accepts definite and indefinite lengths and all
+// three float widths; semantic tags (major 6) are skipped transparently.
+// ---------------------------------------------------------------------------
+
+struct cbor_reader {
+  std::span<const std::uint8_t> in;
+  std::size_t pos = 0;
+  int depth = 0;
+  static constexpr int max_depth = 256;
+
+  [[noreturn]] void fail(const char* msg) const { throw parse_error{msg, pos}; }
+
+  struct depth_guard {
+    cbor_reader& p;
+    explicit depth_guard(cbor_reader& p) : p(p) {
+      if (++p.depth > max_depth) p.fail("nesting too deep");
+    }
+    ~depth_guard() { --p.depth; }
+  };
+
+  std::uint8_t byte() {
+    if (pos >= in.size()) fail("unexpected end of input");
+    return in[pos++];
+  }
+  std::uint64_t be(int bytes) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i) v = v << 8 | byte();
+    return v;
+  }
+
+  struct item {
+    std::uint8_t major;   // 0..7
+    std::uint8_t ai;      // additional info, before argument expansion
+    std::uint64_t value;  // argument: int value, length, tag, float bits
+    bool indefinite() const { return ai == 31; }
+  };
+
+  item raw_head() {
+    std::uint8_t ib = byte();
+    item h{std::uint8_t(ib >> 5), std::uint8_t(ib & 0x1f), ib & 0x1fu};
+    if (h.ai < 24) return h;
+    if (h.ai <= 27) { h.value = be(1 << (h.ai - 24)); return h; }
+    if (h.ai == 31) { h.value = 0; return h; }  // indefinite length / break
+    fail("reserved additional info");
+  }
+
+  // Head of the next data item, with any semantic tags (major 6) skipped.
+  item head() {
+    item h = raw_head();
+    while (h.major == 6) h = raw_head();
+    return h;
+  }
+
+  bool try_break() {
+    if (pos >= in.size()) fail("unexpected end of input");
+    if (in[pos] == 0xff) { ++pos; return true; }
+    return false;
+  }
+
+  void skip_bytes(std::uint64_t n) {
+    if (n > in.size() - pos) fail("truncated string");
+    pos += std::size_t(n);
+  }
+
+  std::string chunk(std::uint64_t n) {
+    if (n > in.size() - pos) fail("truncated string");
+    std::string s(reinterpret_cast<const char*>(in.data() + pos), std::size_t(n));
+    pos += std::size_t(n);
+    return s;
+  }
+
+  std::string text_body(item h) {
+    if (!h.indefinite()) return chunk(h.value);
+    std::string s;
+    while (!try_break()) {
+      item c = raw_head();  // chunks: definite text strings, no tags
+      if (c.major != 3 || c.indefinite()) fail("bad text string chunk");
+      s += chunk(c.value);
+    }
+    return s;
+  }
+
+  std::string text() {
+    item h = head();
+    if (h.major != 3) fail("expected a text string");
+    return text_body(h);
+  }
+
+  // Consumes null; `undefined` (0xf7) is accepted as null too.
+  bool try_null() {
+    std::size_t save = pos;
+    if (pos < in.size()) {
+      item h = head();
+      if (h.major == 7 && (h.ai == 22 || h.ai == 23)) return true;
+    }
+    pos = save;
+    return false;
+  }
+
+  template <typename T>
+  T to_integer(item h) {
+    if (h.major == 0) {
+      if (!std::in_range<T>(h.value)) fail("integer out of range");
+      return T(h.value);
+    }
+    if (h.major == 1) {
+      if (h.value > std::uint64_t(std::numeric_limits<std::int64_t>::max()))
+        fail("integer out of range");
+      std::int64_t v = -1 - std::int64_t(h.value);
+      if (!std::in_range<T>(v)) fail("integer out of range");
+      return T(v);
+    }
+    fail("expected an integer");
+  }
+
+  static double from_half(std::uint16_t h) {  // RFC 8949 appendix D
+    unsigned exp = (h >> 10) & 0x1f, mant = h & 0x3ff;
+    double v = exp == 0  ? std::ldexp(mant, -24)
+             : exp != 31 ? std::ldexp(mant + 1024, int(exp) - 25)
+             : mant == 0 ? std::numeric_limits<double>::infinity()
+                         : std::numeric_limits<double>::quiet_NaN();
+    return (h & 0x8000) ? -v : v;
+  }
+
+  double to_float(item h) {
+    if (h.major == 7) {
+      if (h.ai == 25) return from_half(std::uint16_t(h.value));
+      if (h.ai == 26) return std::bit_cast<float>(std::uint32_t(h.value));
+      if (h.ai == 27) return std::bit_cast<double>(h.value);
+    }
+    if (h.major == 0) return double(h.value);       // ints promote to float
+    if (h.major == 1) return -1.0 - double(h.value);
+    fail("expected a number");
+  }
+
+  // Consume any well-formed data item without storing it (for unknown keys).
+  void skip_value() {
+    depth_guard g(*this);
+    item h = head();
+    switch (h.major) {
+      case 0: case 1: return;  // the argument is the whole item
+      case 2: case 3:
+        if (!h.indefinite()) { skip_bytes(h.value); return; }
+        while (!try_break()) {
+          item c = raw_head();
+          if (c.major != h.major || c.indefinite()) fail("bad string chunk");
+          skip_bytes(c.value);
+        }
+        return;
+      case 4:
+        if (h.indefinite()) { while (!try_break()) skip_value(); return; }
+        for (std::uint64_t i = 0; i < h.value; ++i) skip_value();
+        return;
+      case 5:
+        if (h.indefinite()) {
+          while (!try_break()) { skip_value(); skip_value(); }
+          return;
+        }
+        for (std::uint64_t i = 0; i < h.value; ++i) { skip_value(); skip_value(); }
+        return;
+      default:  // major 7; simple values and floats are fully in the head
+        if (h.indefinite()) fail("unexpected break");
+        return;
+    }
+  }
+};
+
+template <typename T>
+void read_value(cbor_reader& p, T& out);
+
+// --- CBOR variant readers ---------------------------------------------------
+
+template <typename V>
+void read_variant_external(cbor_reader& p, V& out) {
+  cbor_reader::depth_guard g(p);
+  auto h = p.head();
+  if (h.major == 3) {  // unit form: "AltName" selects a default-constructed alt
+    std::string name = p.text_body(h);
+    bool matched = false;
+    template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+      if (!matched && name == alt_name<V, I>()) {
+        matched = true;
+        out.template emplace<I>();
+      }
+    }
+    if (!matched) p.fail("unknown variant name");
+    return;
+  }
+  if (h.major != 5 || (!h.indefinite() && h.value != 1))
+    p.fail("expected a one-entry variant map");
+  std::string name = p.text();
+  bool matched = false;
+  template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+    if (!matched && name == alt_name<V, I>()) {
+      matched = true;
+      std::variant_alternative_t<I, V> tmp{};
+      read_value(p, tmp);
+      out.template emplace<I>(std::move(tmp));
+    }
+  }
+  if (!matched) p.fail("unknown variant name");
+  if (h.indefinite() && !p.try_break()) p.fail("expected a one-entry variant map");
+}
+
+template <typename V>
+void read_variant_internal(cbor_reader& p, V& out, std::string_view tag_key) {
+  std::size_t start = p.pos;
+  // First pass: scan the map for the tag key.
+  std::string name;
+  bool found = false;
+  {
+    cbor_reader::depth_guard g(p);
+    auto h = p.head();
+    if (h.major != 5) p.fail("expected an object");
+    auto entry = [&] {
+      std::string k = p.text();
+      if (!found && k == tag_key) {
+        name = p.text();
+        found = true;
+      } else {
+        p.skip_value();
+      }
+    };
+    if (h.indefinite()) { while (!p.try_break()) entry(); }
+    else for (std::uint64_t i = 0; i < h.value; ++i) entry();
+  }
+  if (!found) p.fail("missing variant tag");
+  // Second pass: re-parse the map as the selected alternative; the tag
+  // key is dropped as an unknown field.
+  p.pos = start;
+  bool matched = false;
+  template for (constexpr auto I : indices<std::variant_size_v<V>>()) {
+    if (!matched && name == alt_name<V, I>()) {
+      matched = true;
+      std::variant_alternative_t<I, V> tmp{};
+      static_assert(reflectable_struct<std::variant_alternative_t<I, V>>,
+                    "sardine::tag requires all variant alternatives to be structs");
+      read_value(p, tmp);
+      out.template emplace<I>(std::move(tmp));
+    }
+  }
+  if (!matched) p.fail("unknown variant tag value");
+}
+
+// --- CBOR struct reader -----------------------------------------------------
+
+template <typename T>
+void read_struct(cbor_reader& p, T& out) {
+  std::array<bool, members_of<T>().size()> seen{};
+  cbor_reader::depth_guard g(p);
+  auto h = p.head();
+  if (h.major != 5) p.fail("expected an object");
+  auto entry = [&] {
+    std::string key = p.text();
+    if (!try_read_key(p, out, key, seen.data())) {
+      if constexpr (has<deny_unknown_fields>(^^T)) p.fail("unknown field");
+      else p.skip_value();
+    }
+  };
+  if (h.indefinite()) { while (!p.try_break()) entry(); }
+  else for (std::uint64_t i = 0; i < h.value; ++i) entry();
+  check_required<T>(p, seen.data());
+}
+
+template <typename T>
+void read_value(cbor_reader& p, T& out) {
+  if constexpr (std::same_as<T, bool>) {
+    auto h = p.head();
+    if (h.major == 7 && h.ai == 20) out = false;
+    else if (h.major == 7 && h.ai == 21) out = true;
+    else p.fail("expected true or false");
+  } else if constexpr (std::is_enum_v<T>) {
+    std::size_t at = p.pos;
+    auto h = p.head();
+    if (h.major == 3) {
+      std::string name = p.text_body(h);
+      template for (constexpr auto e : enumerators_of<T>()) {
+        if (name == json_name<T>(e)) {
+          out = [:e:];
+          return;
+        }
+      }
+      p.pos = at;
+      p.fail("unknown enumerator");
+    } else {
+      out = static_cast<T>(p.to_integer<std::underlying_type_t<T>>(h));
+    }
+  } else if constexpr (std::integral<T>) {
+    out = p.to_integer<T>(p.head());
+  } else if constexpr (std::floating_point<T>) {
+    out = static_cast<T>(p.to_float(p.head()));
+  } else if constexpr (std::same_as<T, std::string>) {
+    out = p.text();
+  } else if constexpr (is_optional<T>::value) {
+    if (p.try_null()) {
+      out.reset();
+    } else {
+      out.emplace();
+      read_value(p, *out);
+    }
+  } else if constexpr (std::same_as<T, std::monostate>) {
+    if (!p.try_null()) p.fail("expected null");
+  } else if constexpr (is_variant<T>::value) {
+    read_variant_external(p, out);
+  } else if constexpr (map_like<T>) {
+    cbor_reader::depth_guard g(p);
+    auto h = p.head();
+    if (h.major != 5) p.fail("expected a map");
+    out.clear();
+    auto entry = [&] {
+      using K = typename T::key_type;
+      if constexpr (string_like<K>) {
+        read_value(p, out[K(p.text())]);
+      } else {  // integer key: native, or text for JSON-converted documents
+        auto kh = p.head();
+        K k{};
+        if (kh.major == 3) {
+          std::string s = p.text_body(kh);
+          auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), k);
+          if (ec != std::errc{} || end != s.data() + s.size())
+            p.fail("expected an integer map key");
+        } else {
+          k = p.to_integer<K>(kh);
+        }
+        read_value(p, out[k]);
+      }
+    };
+    if (h.indefinite()) { while (!p.try_break()) entry(); }
+    else for (std::uint64_t i = 0; i < h.value; ++i) entry();
+  } else if constexpr (sequence_like<T>) {
+    cbor_reader::depth_guard g(p);
+    auto h = p.head();
+    if (h.major != 4) p.fail("expected an array");
+    out.clear();
+    if (h.indefinite()) { while (!p.try_break()) read_value(p, out.emplace_back()); }
+    else for (std::uint64_t i = 0; i < h.value; ++i) read_value(p, out.emplace_back());
   } else if constexpr (reflectable_struct<T>) {
     read_struct(p, out);
   } else {
@@ -1194,6 +1762,30 @@ std::expected<T, error> from_json(std::string_view json) {
     p.skip_ws();
     if (p.pos != json.size())
       return std::unexpected(error{"trailing characters after value", p.pos});
+  } catch (const detail::parse_error& e) {
+    return std::unexpected(error{e.message, e.offset});
+  }
+  return value;
+}
+
+// CBOR (RFC 8949) with the same data model and annotations as to_json:
+// structs are maps with text keys, enums and variant tags are text strings.
+// Integer map keys stay integers (JSON must stringify them).
+template <typename T>
+std::vector<std::uint8_t> to_cbor(const T& value) {
+  detail::cbor_writer w;
+  w.write(value);
+  return std::move(w.out);
+}
+
+template <typename T>
+std::expected<T, error> from_cbor(std::span<const std::uint8_t> cbor) {
+  detail::cbor_reader p{cbor};
+  T value{};
+  try {
+    detail::read_value(p, value);
+    if (p.pos != cbor.size())
+      return std::unexpected(error{"trailing bytes after value", p.pos});
   } catch (const detail::parse_error& e) {
     return std::unexpected(error{e.message, e.offset});
   }
