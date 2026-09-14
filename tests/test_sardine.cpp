@@ -56,6 +56,8 @@ enum class [[=sardine::rename_all("SCREAMING_SNAKE_CASE")]] Level {
 };
 
 enum class Color { red, green, blue };
+// Numeric enum reads are opt-in; Mode takes the opt-in, Color stays strict.
+enum class [[=sardine::enum_from_number{}]] Mode { off, on };
 
 struct Inner {
   std::vector<int> values;
@@ -126,14 +128,14 @@ static void test_pretty_json() {
             "  \"active\": true\n"
             "}");
 
+  // A disengaged optional member is omitted, not written as null.
   Inner i{.values = {1, 2}, .note = std::nullopt};
   EXPECT_EQ(sardine::to_json_pretty(i),
             "{\n"
             "  \"values\": [\n"
             "    1,\n"
             "    2\n"
-            "  ],\n"
-            "  \"note\": null\n"
+            "  ]\n"
             "}");
 
   // empty containers stay inline, indent width is configurable
@@ -195,13 +197,21 @@ static void test_enums() {
   auto lvl = sardine::from_json<Level>(R"("DEBUG_INFO")");
   EXPECT(lvl.has_value() && *lvl == Level::debug_info);
 
-  // Un-named enum value falls back to the underlying integer, both ways.
+  // Un-named enum value falls back to the underlying integer on WRITE; the
+  // read side takes a number only where the enum opted in.
   EXPECT_EQ(sardine::to_json(static_cast<Color>(9)), "9");
   auto c9 = sardine::from_json<Color>("9");
-  EXPECT(c9.has_value() && *c9 == static_cast<Color>(9));
+  EXPECT(!c9.has_value());
+  EXPECT(c9.error().code == sardine::errc::type_mismatch);
+
+  auto m1 = sardine::from_json<Mode>("1");
+  EXPECT(m1.has_value() && *m1 == Mode::on);
+  auto m9 = sardine::from_json<Mode>("9");
+  EXPECT(m9.has_value() && *m9 == static_cast<Mode>(9));
 
   auto bad = sardine::from_json<Color>(R"("magenta")");
   EXPECT(!bad.has_value());
+  EXPECT(bad.error().code == sardine::errc::unknown_enum);
 }
 
 static void test_variants() {
@@ -481,7 +491,9 @@ static void test_cbor_roundtrip() {
   auto mb = sardine::from_cbor<MaybeShape>(sardine::to_cbor(MaybeShape{}));
   EXPECT(mb.has_value() && std::holds_alternative<std::monostate>(*mb));
   auto c9 = sardine::from_cbor<Color>(sardine::to_cbor(static_cast<Color>(9)));
-  EXPECT(c9.has_value() && *c9 == static_cast<Color>(9));
+  EXPECT(!c9.has_value());  // numeric enum reads are opt-in (enum_from_number)
+  auto m9 = sardine::from_cbor<Mode>(sardine::to_cbor(static_cast<Mode>(9)));
+  EXPECT(m9.has_value() && *m9 == static_cast<Mode>(9));
 
   // nan/inf survive CBOR (JSON degrades them to null)
   auto nb = sardine::from_cbor<double>(
@@ -550,6 +562,288 @@ static void test_errors() {
   if (!e) EXPECT(e.error().offset > 0);
 }
 
+
+// --- new-feature tests --------------------------------------------------------
+
+static void test_error_codes_and_paths() {
+  struct Leaf { [[=sardine::required{}]] int n = 0; };
+  struct [[=sardine::deny_unknown_fields{}]] Doc {
+    std::string name;
+    std::vector<Leaf> items;
+  };
+
+  // unknown field: code + dotted path naming the offender
+  auto u = sardine::from_json<Doc>(R"({"name":"x","surprise":1})");
+  EXPECT(!u.has_value());
+  EXPECT(u.error().code == sardine::errc::unknown_field);
+  EXPECT_EQ(u.error().path, "surprise");
+
+  // type mismatch deep inside an array: "items.0.n"
+  auto t = sardine::from_json<Doc>(R"({"items":[{"n":"nope"}]})");
+  EXPECT(!t.has_value());
+  EXPECT(t.error().code == sardine::errc::type_mismatch);
+  EXPECT_EQ(t.error().path, "items.0.n");
+
+  // missing required field: path names it
+  auto m = sardine::from_json<Doc>(R"({"items":[{}]})");
+  EXPECT(!m.has_value());
+  EXPECT(m.error().code == sardine::errc::missing_field);
+  EXPECT_EQ(m.error().path, "items.0.n");
+
+  // fractional where an integer belongs is a type error, garbage is not
+  auto frac = sardine::from_json<int>("1.5");
+  EXPECT(!frac.has_value() && frac.error().code == sardine::errc::type_mismatch);
+  auto junk = sardine::from_json<int>("--");
+  EXPECT(!junk.has_value() && junk.error().code == sardine::errc::invalid_number);
+
+  auto trail = sardine::from_json<int>("1 2");
+  EXPECT(!trail.has_value() && trail.error().code == sardine::errc::trailing);
+
+  // CBOR carries the same codes and paths
+  auto cd = sardine::from_cbor<Doc>(
+      bytes({0xa1, 0x64, 'n', 'a', 'm', 'e', 0x01}));
+  EXPECT(!cd.has_value());
+  EXPECT(cd.error().code == sardine::errc::type_mismatch);
+  EXPECT_EQ(cd.error().path, "name");
+}
+
+static void test_cbor_strict_profile() {
+  using sardine::cbor_strict;
+
+  // Non-minimal heads: 23 in a one-byte argument, 24 in a two-byte argument.
+  auto nm1 = sardine::from_cbor<std::uint64_t>(bytes({0x18, 0x17}), cbor_strict);
+  EXPECT(!nm1.has_value() && nm1.error().code == sardine::errc::invalid_encoding);
+  auto nm2 = sardine::from_cbor<std::uint64_t>(bytes({0x19, 0x00, 0x18}), cbor_strict);
+  EXPECT(!nm2.has_value());
+  // ...while the minimal spellings of the boundary values pass.
+  auto ok24 = sardine::from_cbor<std::uint64_t>(bytes({0x18, 0x18}), cbor_strict);
+  EXPECT(ok24.has_value() && *ok24 == 24);
+  auto ok256 = sardine::from_cbor<std::uint64_t>(bytes({0x19, 0x01, 0x00}), cbor_strict);
+  EXPECT(ok256.has_value() && *ok256 == 256);
+
+  // Indefinite lengths.
+  auto ind = sardine::from_cbor<std::vector<int>>(bytes({0x9f, 0x01, 0xff}), cbor_strict);
+  EXPECT(!ind.has_value() && ind.error().code == sardine::errc::invalid_encoding);
+
+  // Tags.
+  auto tag = sardine::from_cbor<std::string>(bytes({0xc0, 0x60}), cbor_strict);
+  EXPECT(!tag.has_value() && tag.error().code == sardine::errc::invalid_encoding);
+
+  // Substitutions: half float, int-as-float, undefined-as-null, text int key.
+  auto half = sardine::from_cbor<double>(bytes({0xf9, 0x3c, 0x00}), cbor_strict);
+  EXPECT(!half.has_value());
+  auto intf = sardine::from_cbor<double>(bytes({0x01}), cbor_strict);
+  EXPECT(!intf.has_value());
+  auto undef = sardine::from_cbor<std::optional<int>>(bytes({0xf7}), cbor_strict);
+  EXPECT(!undef.has_value());
+  auto tkey = sardine::from_cbor<std::map<int, int>>(
+      bytes({0xa1, 0x61, '3', 0x01}), cbor_strict);
+  EXPECT(!tkey.has_value());
+
+  // The default profile still takes all of them.
+  EXPECT(sardine::from_cbor<std::uint64_t>(bytes({0x18, 0x17})).has_value());
+  EXPECT(sardine::from_cbor<std::vector<int>>(bytes({0x9f, 0x01, 0xff})).has_value());
+  EXPECT(sardine::from_cbor<std::string>(bytes({0xc0, 0x60})).has_value());
+  EXPECT(sardine::from_cbor<double>(bytes({0xf9, 0x3c, 0x00})).has_value());
+}
+
+static void test_cbor_bytes() {
+  // RFC 8949 appendix A: h\'\' and h\'01020304\'.
+  EXPECT_EQ(sardine::to_cbor(std::vector<std::uint8_t>{}), bytes({0x40}));
+  EXPECT_EQ(sardine::to_cbor(std::vector<std::uint8_t>{1, 2, 3, 4}),
+            bytes({0x44, 0x01, 0x02, 0x03, 0x04}));
+
+  auto back = sardine::from_cbor<std::vector<std::uint8_t>>(
+      bytes({0x44, 0x01, 0x02, 0x03, 0x04}));
+  EXPECT(back.has_value() && (*back == std::vector<std::uint8_t>{1, 2, 3, 4}));
+
+  // std::array and std::span write as byte strings too.
+  std::array<std::uint8_t, 2> arr{0xaa, 0xbb};
+  EXPECT_EQ(sardine::to_cbor(arr), bytes({0x42, 0xaa, 0xbb}));
+  EXPECT_EQ(sardine::to_cbor(std::span<const std::uint8_t>(arr)),
+            bytes({0x42, 0xaa, 0xbb}));
+
+  // As a struct member.
+  struct Blob { std::vector<std::uint8_t> data; };
+  Blob b{.data = {0xde, 0xad}};
+  EXPECT_EQ(sardine::to_cbor(b),
+            bytes({0xa1, 0x64, 'd', 'a', 't', 'a', 0x42, 0xde, 0xad}));
+  auto bb = sardine::from_cbor<Blob>(sardine::to_cbor(b));
+  EXPECT(bb.has_value() && bb->data == b.data);
+
+  // Lenient mode also reads the pre-bytes spelling: an array of integers.
+  auto legacy = sardine::from_cbor<std::vector<std::uint8_t>>(
+      bytes({0x82, 0x01, 0x02}));
+  EXPECT(legacy.has_value() && (*legacy == std::vector<std::uint8_t>{1, 2}));
+  auto strict_legacy = sardine::from_cbor<std::vector<std::uint8_t>>(
+      bytes({0x82, 0x01, 0x02}), sardine::cbor_strict);
+  EXPECT(!strict_legacy.has_value());
+
+  // Indefinite-length byte string: chunks concatenate (lenient only).
+  auto chunked = sardine::from_cbor<std::vector<std::uint8_t>>(
+      bytes({0x5f, 0x41, 0x01, 0x41, 0x02, 0xff}));
+  EXPECT(chunked.has_value() && (*chunked == std::vector<std::uint8_t>{1, 2}));
+
+  // JSON side is unchanged: bytes are an array of numbers.
+  EXPECT_EQ(sardine::to_json(std::vector<std::uint8_t>{1, 2}), "[1,2]");
+}
+
+// COSE_Key-shaped: RFC 9052 integer labels, negative for the EC2 parameters.
+struct CoseKey {
+  [[=sardine::int_key(1), =sardine::required{}]] std::int64_t kty = 0;
+  [[=sardine::int_key(3), =sardine::required{}]] std::int64_t alg = 0;
+  [[=sardine::int_key(-1)]] std::int64_t crv = 0;
+  [[=sardine::int_key(-2)]] std::vector<std::uint8_t> x;
+  [[=sardine::int_key(-3)]] std::optional<std::vector<std::uint8_t>> y;
+};
+
+static void test_int_key() {
+  CoseKey k{.kty = 2, .alg = -7, .crv = 1, .x = {0x11, 0x22}, .y = std::nullopt};
+  // {1: 2, 3: -7, -1: 1, -2: h\'1122\'} — y omitted while disengaged.
+  EXPECT_EQ(sardine::to_cbor(k),
+            bytes({0xa4, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x42, 0x11,
+                   0x22}));
+  auto back = sardine::from_cbor<CoseKey>(sardine::to_cbor(k));
+  EXPECT(back.has_value());
+  EXPECT(back->kty == 2 && back->alg == -7 && back->crv == 1);
+  EXPECT((back->x == std::vector<std::uint8_t>{0x11, 0x22}) && !back->y);
+
+  // Unknown integer labels skip like unknown text keys (no deny on CoseKey).
+  auto extra = sardine::from_cbor<CoseKey>(
+      bytes({0xa3, 0x01, 0x02, 0x03, 0x26, 0x04, 0x63, 'e', 'x', 't'}));
+  EXPECT(extra.has_value() && extra->kty == 2);
+
+  // A required int_key member missing: code + decimal path.
+  auto missing = sardine::from_cbor<CoseKey>(bytes({0xa1, 0x01, 0x02}));
+  EXPECT(!missing.has_value());
+  EXPECT(missing.error().code == sardine::errc::missing_field);
+  EXPECT_EQ(missing.error().path, "3");
+
+  // JSON spells the labels in decimal.
+  EXPECT_EQ(sardine::to_json(k), R"({"1":2,"3":-7,"-1":1,"-2":[17,34]})");
+  auto jback = sardine::from_json<CoseKey>(sardine::to_json(k));
+  EXPECT(jback.has_value() && jback->alg == -7);
+}
+
+static void test_cbor_raw() {
+  struct Att {
+    std::string fmt;
+    [[=sardine::rename("attStmt")]] sardine::cbor_raw att_stmt;
+    std::vector<std::uint8_t> auth;
+  };
+  // {"fmt":"none","attStmt":{},"auth":h\'ff\'}
+  auto wire = bytes({0xa3, 0x63, 'f', 'm', 't', 0x64, 'n', 'o', 'n', 'e',
+                     0x67, 'a', 't', 't', 'S', 't', 'm', 't', 0xa0,
+                     0x64, 'a', 'u', 't', 'h', 0x41, 0xff});
+  auto a = sardine::from_cbor<Att>(wire);
+  EXPECT(a.has_value());
+  EXPECT_EQ(a->fmt, "none");
+  EXPECT_EQ(a->att_stmt.bytes, bytes({0xa0}));  // verbatim, uninterpreted
+  EXPECT_EQ(a->auth, bytes({0xff}));
+  // Round-trip splices the raw item back byte-for-byte.
+  EXPECT_EQ(sardine::to_cbor(*a), wire);
+
+  // The raw item must still be well-formed...
+  auto bad = sardine::from_cbor<sardine::cbor_raw>(bytes({0xa1, 0x01}));
+  EXPECT(!bad.has_value());
+  // ...and the active profile applies inside it.
+  auto ind = sardine::from_cbor<sardine::cbor_raw>(bytes({0x9f, 0x01, 0xff}),
+                                                   sardine::cbor_strict);
+  EXPECT(!ind.has_value());
+
+  // Empty raw writes null.
+  EXPECT_EQ(sardine::to_cbor(sardine::cbor_raw{}), bytes({0xf6}));
+}
+
+static void test_value_tree() {
+  // Any document parses; order and duplicate keys survive; find is first-wins.
+  auto v = sardine::from_json<sardine::value>(
+      R"({"z":1,"a":[true,null,"s",2.5],"z":2})");
+  EXPECT(v.has_value());
+  EXPECT(v->is_object() && v->as_object().size() == 3);
+  EXPECT(v->find("z") && v->find("z")->as_int() == 1);
+  const auto& arr = v->find("a")->as_array();
+  EXPECT(arr.size() == 4 && arr[0].as_bool() && arr[1].is_null());
+  EXPECT(arr[2].as_string() == "s" && arr[3].as_double() == 2.5);
+
+  // Dump is compact, insertion-ordered, shortest-round-trip numbers.
+  EXPECT_EQ(sardine::to_json(*v), R"({"z":1,"a":[true,null,"s",2.5],"z":2})");
+
+  // int64 overflow degrades to double instead of failing.
+  auto big = sardine::from_json<sardine::value>("18446744073709551616");
+  EXPECT(big.has_value() && big->is_double());
+
+  // Works as a struct member: the typed envelope / generic payload split.
+  struct Envelope {
+    std::string kind;
+    std::optional<sardine::value> payload;
+  };
+  auto e = sardine::from_json<Envelope>(R"({"kind":"x","payload":{"n":[1]}})");
+  EXPECT(e.has_value() && e->payload.has_value());
+  EXPECT(e->payload->find("n")->as_array()[0].as_int() == 1);
+  EXPECT_EQ(sardine::to_json(*e), R"({"kind":"x","payload":{"n":[1]}})");
+
+  // Errors inside a document still carry paths.
+  auto bad = sardine::from_json<sardine::value>(R"({"a":[1,)");
+  EXPECT(!bad.has_value());
+  EXPECT(bad.error().code == sardine::errc::truncated);
+}
+
+static void test_from_json_into() {
+  struct Limits { int lo = 1; int hi = 99; };
+  struct Cfg {
+    std::string name = "default";
+    std::optional<int> timeout = 30;
+    Limits limits;
+    std::vector<int> tags = {1, 2};
+  };
+
+  Cfg c;
+  // Absent fields keep their values; nested structs merge; containers replace;
+  // an explicit null resets an optional.
+  auto r = sardine::from_json_into(
+      R"({"timeout":null,"limits":{"hi":50},"tags":[9]})", c);
+  EXPECT(r.has_value());
+  EXPECT_EQ(c.name, "default");            // absent: kept
+  EXPECT(!c.timeout.has_value());          // null: reset
+  EXPECT(c.limits.lo == 1 && c.limits.hi == 50);  // nested merge
+  EXPECT((c.tags == std::vector{9}));      // container replaced whole
+
+  // Errors leave a diagnosable result and report like from_json.
+  auto bad = sardine::from_json_into("{bad", c);
+  EXPECT(!bad.has_value());
+}
+
+static void test_cbor_prefix() {
+  // One item decoded off the front; the caller learns where it ended.
+  auto buf = bytes({0xa1, 0x01, 0x02, /* trailing: */ 0xde, 0xad});
+  std::size_t used = 0;
+  auto m = sardine::from_cbor_prefix<std::map<int, int>>(buf, used);
+  EXPECT(m.has_value() && m->at(1) == 2);
+  EXPECT_EQ(used, 3uz);
+
+  // from_cbor on the same buffer refuses the trailing bytes.
+  auto whole = sardine::from_cbor<std::map<int, int>>(buf);
+  EXPECT(!whole.has_value() && whole.error().code == sardine::errc::trailing);
+}
+
+static void test_omit_none_and_emit_null() {
+  struct P {
+    std::optional<int> a;
+    [[=sardine::emit_null{}]] std::optional<int> b;
+  };
+  // a vanishes when disengaged; b opted back into explicit null.
+  EXPECT_EQ(sardine::to_json(P{}), R"({"b":null})");
+  EXPECT_EQ(sardine::to_json(P{.a = 1, .b = 2}), R"({"a":1,"b":2})");
+  // CBOR map arity matches what is actually emitted.
+  EXPECT_EQ(sardine::to_cbor(P{}), bytes({0xa1, 0x61, 'b', 0xf6}));
+  EXPECT_EQ(sardine::to_cbor(P{.a = 1, .b = std::nullopt}),
+            bytes({0xa2, 0x61, 'a', 0x01, 0x61, 'b', 0xf6}));
+  // Reading is symmetric: absent keeps the default, null resets.
+  auto back = sardine::from_json<P>(R"({"b":null})");
+  EXPECT(back.has_value() && !back->a && !back->b);
+}
+
 int main() {
   test_basic_roundtrip();
   test_pretty_json();
@@ -572,6 +866,15 @@ int main() {
   test_cbor_decoder_lenience();
   test_cbor_errors();
   test_errors();
+  test_error_codes_and_paths();
+  test_cbor_strict_profile();
+  test_cbor_bytes();
+  test_int_key();
+  test_cbor_raw();
+  test_value_tree();
+  test_from_json_into();
+  test_cbor_prefix();
+  test_omit_none_and_emit_null();
 
   if (failures == 0) std::println("all tests passed");
   else std::println("{} FAILURES", failures);

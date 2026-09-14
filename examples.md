@@ -317,13 +317,16 @@ sardine::debug(Shape{Circle{2}});         // Circle { radius: 2.0 }
 
 ## 11. Error handling
 
-`from_json` never throws — it returns `std::expected<T, sardine::error>` with a
-message and the byte offset of the failure:
+`from_json` never throws — it returns `std::expected<T, sardine::error>` with
+a message, the byte offset, an `errc` code to branch on, and the dotted path
+of the failure inside the document:
 
 ```cpp
-auto r = sardine::from_json<User>(R"({"name": 12})");
+auto r = sardine::from_json<Order>(R"({"items":[{"name":7}]})");
 if (!r) {
-  std::println("parse failed at byte {}: {}", r.error().offset,
+  // r.error().code == sardine::errc::type_mismatch
+  // r.error().path == "items.0.name"
+  std::println("at {} (byte {}): {}", r.error().path, r.error().offset,
                r.error().message);
 }
 ```
@@ -332,6 +335,58 @@ Malformed JSON, type mismatches, integer overflow, lone surrogates, raw
 control characters in strings, unknown enumerators, unmatched variant tags,
 and trailing garbage are all reported this way. Nesting depth is capped at
 256 to keep hostile inputs from blowing the stack.
+
+## 11b. The generic document, and overlays
+
+```cpp
+// A document whose shape is the data's, not the program's:
+auto doc = sardine::from_json<sardine::value>(config_text);
+if (const sardine::value* v = doc->find("workflow"))
+  walk(*v);   // is_object()/as_array()/find() — insertion order and duplicate
+              // keys preserved, find() returns the first match
+
+// A typed envelope carrying an arbitrary payload:
+struct Request {
+  [[=sardine::required{}]] std::string op;
+  std::optional<sardine::value> payload;
+};
+
+// Overlay/patch: named fields overwrite, omitted fields keep their values,
+// explicit null resets an optional, nested structs merge recursively.
+Config cfg;                                   // the defaults
+auto r = sardine::from_json_into(user_config_text, cfg);
+```
+
+## 8e. CBOR for protocol work
+
+```cpp
+// Bytes are bytes (major 2), not arrays of numbers:
+struct Envelope {
+  [[=sardine::required{}]] std::vector<std::uint8_t> nonce;
+  [[=sardine::required{}]] std::vector<std::uint8_t> body;
+  std::optional<std::vector<std::uint8_t>> re;   // omitted while disengaged
+};
+
+// A signed wire accepts exactly one encoding per meaning:
+auto e = sardine::from_cbor<Envelope>(wire, sardine::cbor_strict);
+
+// COSE-style integer labels, and a verbatim field you don't interpret:
+struct CoseKey {
+  [[=sardine::int_key(1),  =sardine::required{}]] std::int64_t kty = 0;
+  [[=sardine::int_key(3),  =sardine::required{}]] std::int64_t alg = 0;
+  [[=sardine::int_key(-2)]] std::vector<std::uint8_t> x;
+};
+struct Attestation {
+  std::string fmt;
+  [[=sardine::rename("attStmt")]] sardine::cbor_raw att_stmt;  // kept, unread
+  [[=sardine::rename("authData")]] std::vector<std::uint8_t> auth_data;
+};
+
+// CBOR embedded mid-buffer: decode one item, learn where it ended.
+std::size_t used = 0;
+auto key = sardine::from_cbor_prefix<CoseKey>(tail, used);
+tail = tail.subspan(used);
+```
 
 ## 12. Everything composes
 
