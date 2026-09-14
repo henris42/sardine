@@ -78,6 +78,12 @@ empty one writes null.
 - `nonstatic_data_members_of` returns a heap `std::vector` — pipe through
   `std::define_static_array` before `template for`.
 - GCC spells the annotation query `annotations_of_with_type(info, info)`.
+- **Block-scope structs need program-unique names.** GCC trunk mangles a
+  reflection template argument (`^^local_struct::member`) without the
+  enclosing function scope, so two local structs with the same name and a
+  same-named member collide in one comdat group — an ICE
+  (`symtab_node::verify failed`) when both are serialized in one TU. Local
+  DTOs work fine; just don't call two of them `ask`.
 
 ## Errors
 

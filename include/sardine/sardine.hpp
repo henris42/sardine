@@ -765,7 +765,10 @@ struct parser {
     return false;
   }
   void expect(char c) {
-    if (!consume(c)) fail("unexpected character");
+    if (!consume(c)) {
+      if (pos >= in.size()) fail("unexpected end of input", errc::truncated);
+      fail("unexpected character");
+    }
   }
   bool consume_word(std::string_view w) {
     skip_ws();
@@ -971,6 +974,8 @@ void read_number(parser& p, T& out) {
   std::string_view tok = p.number_token();
   auto [end, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), out);
   if (ec == std::errc{} && end == tok.data() + tok.size()) return;
+  if (ec == std::errc::result_out_of_range)
+    p.fail("number out of range", errc::out_of_range);
   if constexpr (std::floating_point<T>) {
     p.fail("invalid number", errc::invalid_number);
   } else {
@@ -1236,6 +1241,7 @@ void read_value(parser& p, T& out) {
   } else if constexpr (std::integral<T> || std::floating_point<T>) {
     read_number(p, out);
   } else if constexpr (std::same_as<T, std::string>) {
+    if (p.peek() != '"') p.fail("expected a string", errc::type_mismatch);
     out = p.parse_string();
   } else if constexpr (std::same_as<T, cbor_raw>) {
     static_assert(false, "sardine: cbor_raw is CBOR-only");
