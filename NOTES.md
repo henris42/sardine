@@ -49,10 +49,21 @@ the lenient decoder still reads that spelling.
 the default decoder is liberal — it accepts indefinite-length
 strings/arrays/maps, non-minimal argument encodings, half-precision floats,
 integers where a float is expected, text-encoded integer map keys,
-`undefined` as null, and skips semantic tags. Each lenience has an off
-switch (`minimal_heads`, `definite_only`, `no_tags`, `no_substitutions`), and
-`sardine::cbor_strict` turns them all off — for wires where a message is
-signed and exactly one encoding of it may verify.
+`undefined` as null, duplicate map keys (last wins), non-UTF-8 text, and
+skips semantic tags. Each lenience has an off switch (`minimal_heads`,
+`definite_only`, `no_tags`, `no_substitutions`, `reject_duplicate_keys`,
+`validate_utf8`), and `sardine::cbor_strict` turns them all off. Both
+profiles refuse input that RFC 8949 §3.3 calls not well-formed (ai 31 on an
+integer or tag head, two-byte simple values below 32, stray breaks, bad
+chunk types) — that is not a profile choice.
+
+`cbor_strict` is the **sardine canonical profile**, not RFC 8949 §4.2
+deterministic encoding: map keys stay in declaration/container order (§4.2
+wants bytewise-sorted keys) and floats keep their static width (§4.2 wants
+shortest-float). It guarantees "exactly one encoding verifies" between
+sardine endpoints; a non-sardine verifier of the same wire must implement
+this profile, or a future `sorted_keys` / deterministic-writer pair closes
+the gap for COSE-style interop. Freeze whichever the wire picks in fixtures.
 
 **`from_cbor_prefix(span, consumed, opts)`** decodes one item off the front
 of a buffer and reports its length — for CBOR embedded mid-structure
@@ -61,9 +72,10 @@ of a buffer and reports its length — for CBOR embedded mid-structure
 **`[[=sardine::int_key(N)]]`** gives a struct field an integer map key
 (negative allowed) — COSE/CTAP-shaped protocols (RFC 9052 labels). CBOR
 writes and matches the label natively; JSON spells it as a decimal string
-key. The decimal text spelling also matches in CBOR (JSON-converted
-documents), so don't combine int_key with a signed strict wire that must
-refuse the text spelling.
+key. The decimal text spelling also matches in lenient CBOR (JSON-converted
+documents); under `no_substitutions` — and therefore under `cbor_strict` —
+a text key never matches an int_key member, so `{3: a}` and `{"3": a}` are
+two different documents on the strict wire.
 
 **`sardine::cbor_raw`** holds one verbatim, validated-but-uninterpreted CBOR
 item (WebAuthn `attStmt`, extensions carried through unread). CBOR-only; an
@@ -85,13 +97,58 @@ empty one writes null.
   (`symtab_node::verify failed`) when both are serialized in one TU. Local
   DTOs work fine; just don't call two of them `ask`.
 
+## Security profile
+
+Which knobs to set, by what the input is:
+
+- **Hostile input at scale** (public HTTP bodies, anything unauthenticated):
+  the JSON defaults already enforce what RFC 8259 requires of the document —
+  UTF-8 (`validate_utf8`) and the §6 number grammar (`strict_numbers`) — and
+  both readers take a `limits{}` budget: `max_depth` (default 256; lower it
+  for public endpoints — each level costs several stack frames),
+  `max_string_bytes`, `max_elements` per container (a definite CBOR length
+  beyond it is refused before any element is read), and `max_total_items`
+  for the whole document, skipped values included. Every budget fails with
+  `errc::limit_exceeded`. Add `deny_unknown_fields` decoder-wide so the
+  strict-unknown-key property is a call-site fact rather than a per-type
+  annotation audit; `[[=sardine::allow_unknown_fields{}]]` opts the rare
+  pass-through type back out (per-type deny still wins).
+- **Signed or hashed wires**: `cbor_strict` (minimal heads, definite
+  lengths, no tags, no substitutions, duplicate keys rejected, UTF-8
+  enforced, int_key text spellings refused). For JSON set
+  `reject_duplicate_keys`; the defaults cover numbers and UTF-8. Do not put
+  `sardine::value` on a signed wire — it preserves duplicate keys by design.
+- **Logged errors**: `redact_paths` replaces document key text in
+  `error.path` with `<key>` while keeping indices, matched member names, and
+  int_key labels. Even unredacted, path segments cap at 64 bytes and the
+  joined path at 1024 (`…`-marked, cut at UTF-8 boundaries), and
+  `error.message` is always a static string — it never contains input bytes.
+- **Deliberately lenient defaults**: duplicate keys (last wins, matching
+  most JSON parsers), CBOR's substitutions/tags/indefinite lengths, and
+  non-UTF-8 CBOR text stay accepted by default because real peers emit them
+  (WebAuthn authenticators, JSON-converted documents, hand-written config).
+  Strictness is a wire contract, so it is opt-in per call site.
+
+**Variant mode complexity**: `untagged` tries alternatives by parse-and-
+rewind — k alternatives nested d deep can re-parse a subtree up to k^d
+times. Every retry burns `max_total_items` budget, so the amplification is
+bounded (and reported as `limit_exceeded`, not `unknown_variant`), but on
+public endpoints prefer externally or internally tagged forms. Internally
+tagged variants scan the object twice — a constant factor, also budgeted.
+
+**Exception boundary**: `parse_error` never escapes the public API; `from_*`
+return `std::expected`. The exception is allocation failure —
+`std::bad_alloc` propagates.
+
 ## Errors
 
-`sardine::error` carries a human message, the byte offset, an `errc` code to
-branch on (`unknown_field`, `missing_field`, `type_mismatch`,
-`invalid_encoding`, …), and the dotted path of the failure inside the
+`sardine::error` carries a human message (static text, never input bytes),
+the byte offset, an `errc` code to branch on (`unknown_field`,
+`missing_field`, `type_mismatch`, `invalid_encoding`, `duplicate_field`,
+`limit_exceeded`, …), and the dotted path of the failure inside the
 document (`"profile.valid_secs"`, `"items.0.name"`). Paths are joined at
-throw time, so they survive unwinding.
+throw time, so they survive unwinding; they are bounded, and redactable,
+as described under Security profile.
 
 ## The generic document: `sardine::value`
 
@@ -124,5 +181,5 @@ The overlay/patch primitive.
   `deny_unknown_fields` on the alternative.
 
 Not implemented: adjacently tagged variants, `serialize_with`, custom
-defaults, `std::tuple`, duplicate-key detection in bound structs (last one
-wins; `sardine::value` preserves duplicates).
+defaults, `std::tuple`. Duplicate keys are last-wins by default and rejected
+under `reject_duplicate_keys`; `sardine::value` always preserves duplicates.
