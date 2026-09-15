@@ -1574,6 +1574,11 @@ struct cbor_reader {
     if (h.ai < 24) return h;
     if (h.ai <= 27) {
       h.value = be(1 << (h.ai - 24));
+      // RFC 8949 §3.3: a simple value in the two-byte form (major 7, ai 24)
+      // must be ≥ 32 — the one-byte spellings own 0..23, and 24..31 are the
+      // ai values themselves.
+      if (h.major == 7 && h.ai == 24 && h.value < 32)
+        fail("invalid two-byte simple value", errc::invalid_encoding);
       // Minimal-width heads: an argument that fit a shorter encoding is a
       // second spelling of the same item. Majors 0–6 only — for major 7 the
       // width IS the meaning (half/single/double float).
@@ -1585,9 +1590,14 @@ struct cbor_reader {
       }
       return h;
     }
-    if (h.ai == 31) {  // indefinite length / break
-      if (opts.definite_only && h.major != 7)
-        fail("indefinite length", errc::invalid_encoding);
+    if (h.ai == 31) {
+      // ai 31 marks indefinite length, valid only for majors 2–5 (RFC 8949
+      // §3.3). A break (major 7) is consumed by try_break before any head is
+      // read, so one arriving here sits where a data item belongs.
+      if (h.major == 7) fail("unexpected break", errc::invalid_encoding);
+      if (h.major < 2 || h.major == 6)
+        fail("indefinite length on an integer or tag", errc::invalid_encoding);
+      if (opts.definite_only) fail("indefinite length", errc::invalid_encoding);
       h.value = 0;
       return h;
     }

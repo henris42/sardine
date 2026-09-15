@@ -647,6 +647,45 @@ static void test_cbor_strict_profile() {
   EXPECT(sardine::from_cbor<double>(bytes({0xf9, 0x3c, 0x00})).has_value());
 }
 
+static void test_cbor_wellformedness() {
+  // RFC 8949 §3.3: additional info 31 is indefinite length (majors 2-5) or
+  // break (major 7) — on an integer or tag head it is not well-formed. These
+  // used to decode as 0, -1, and tag 0.
+  auto i0 = sardine::from_cbor<int>(bytes({0x1f}));
+  EXPECT(!i0.has_value() && i0.error().code == sardine::errc::invalid_encoding);
+  auto i1 = sardine::from_cbor<int>(bytes({0x3f}));
+  EXPECT(!i1.has_value() && i1.error().code == sardine::errc::invalid_encoding);
+  auto tg = sardine::from_cbor<int>(bytes({0xdf, 0x00}));
+  EXPECT(!tg.has_value() && tg.error().code == sardine::errc::invalid_encoding);
+
+  // A two-byte simple value below 32 is not well-formed (0xf8 0x1f).
+  auto sv = sardine::from_cbor<sardine::cbor_raw>(bytes({0xf8, 0x1f}));
+  EXPECT(!sv.has_value() && sv.error().code == sardine::errc::invalid_encoding);
+  // ...while 32 is (0xf8 0x20), even under minimal_heads (major 7 exempt).
+  auto ok = sardine::from_cbor<sardine::cbor_raw>(bytes({0xf8, 0x20}),
+                                                  sardine::cbor_strict);
+  EXPECT(ok.has_value());
+
+  // A break outside an indefinite container is invalid_encoding, not a
+  // type mismatch — fuzz oracles classify on the code.
+  auto br = sardine::from_cbor<int>(bytes({0xff}));
+  EXPECT(!br.has_value() && br.error().code == sardine::errc::invalid_encoding);
+  auto braw = sardine::from_cbor<sardine::cbor_raw>(bytes({0xff}));
+  EXPECT(!braw.has_value() &&
+         braw.error().code == sardine::errc::invalid_encoding);
+
+  // The empty indefinite array stays valid; bad chunk types and nested
+  // indefinite text chunks stay refused.
+  EXPECT(sardine::from_cbor<sardine::cbor_raw>(bytes({0x9f, 0xff})).has_value());
+  auto chunk = sardine::from_cbor<sardine::cbor_raw>(bytes({0x5f, 0x00, 0xff}));
+  EXPECT(!chunk.has_value() &&
+         chunk.error().code == sardine::errc::invalid_encoding);
+  auto nest = sardine::from_cbor<sardine::cbor_raw>(
+      bytes({0x7f, 0x7f, 0x61, 0x61, 0xff, 0xff}));
+  EXPECT(!nest.has_value() &&
+         nest.error().code == sardine::errc::invalid_encoding);
+}
+
 static void test_cbor_bytes() {
   // RFC 8949 appendix A: h\'\' and h\'01020304\'.
   EXPECT_EQ(sardine::to_cbor(std::vector<std::uint8_t>{}), bytes({0x40}));
@@ -868,6 +907,7 @@ int main() {
   test_errors();
   test_error_codes_and_paths();
   test_cbor_strict_profile();
+  test_cbor_wellformedness();
   test_cbor_bytes();
   test_int_key();
   test_cbor_raw();
