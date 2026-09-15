@@ -38,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -162,6 +163,7 @@ enum class errc : std::uint8_t {
   unknown_variant,   // no variant alternative matched / unknown tag
   out_of_range,      // number does not fit the destination type
   invalid_encoding,  // CBOR: reserved bits, bad chunks, or a strict-profile refusal
+  duplicate_field,   // a map/object key occurred twice (reject_duplicate_keys)
 };
 
 struct error {
@@ -191,11 +193,25 @@ struct cbor_options {
   bool no_substitutions = false;  // reject half-floats, ints where floats are
                                   // expected, text-encoded integer map keys,
                                   // and undefined-as-null
+  bool reject_duplicate_keys = false;  // a repeated map key is an error, not
+                                       // last-wins (RFC 8949 §5.6 strictness)
 };
 
 // RFC 8949 §4.2-shaped strictness (heads and lengths; key ORDER stays the
 // writer's, deliberately — sardine encodes declaration/container order).
-inline constexpr cbor_options cbor_strict{true, true, true, true};
+inline constexpr cbor_options cbor_strict{.minimal_heads = true,
+                                          .definite_only = true,
+                                          .no_tags = true,
+                                          .no_substitutions = true,
+                                          .reject_duplicate_keys = true};
+
+// Options for the JSON reader (from_json / from_json_into). The default
+// decoder stays liberal about duplicates — last occurrence wins, matching
+// most JSON parsers — because rejecting them is a wire-contract decision,
+// not a well-formedness one (RFC 8259 leaves the behavior open).
+struct json_options {
+  bool reject_duplicate_keys = false;
+};
 
 // Exactly one CBOR data item, kept as its verbatim bytes. Reading validates
 // well-formedness (under the active cbor_options) without interpreting;
@@ -743,6 +759,7 @@ struct parser {
   std::size_t pos = 0;
   int depth = 0;
   std::vector<std::string> path{};
+  json_options opts{};
   static constexpr int max_depth = 256;
 
   [[noreturn]] void fail(const char* msg, errc code = errc::syntax) const {
@@ -1112,9 +1129,13 @@ void read_member(P& p, F& field) {
 // Route one "key": value pair into `out`. Direct fields first, then fields of
 // flattened structs (recursively), then a flattened catch-all map if present.
 // `seen` (when non-null) tracks which of this level's direct members matched.
+// `int_text_ok` gates whether a TEXT key may match an int_key member's decimal
+// spelling — always true for JSON (whose keys are only ever text), false for
+// CBOR under no_substitutions, where "3" and 3 must stay two different keys.
 // Format-independent: works for any reader `p` that read_member accepts.
 template <typename P, typename T>
-bool try_read_key(P& p, T& out, std::string_view key, bool* seen) {
+bool try_read_key(P& p, T& out, std::string_view key, bool* seen,
+                  bool int_text_ok = true) {
   constexpr auto mems = members_of<T>();
   bool handled = false;
   template for (constexpr auto I : indices<mems.size()>()) {
@@ -1122,11 +1143,14 @@ bool try_read_key(P& p, T& out, std::string_view key, bool* seen) {
     if constexpr (!skip_de(m)) {
       using M = [:std::meta::type_of(m):];
       if constexpr (has<flatten>(m) && reflectable_struct<M>) {
-        if (!handled) handled = try_read_key(p, out.[:m:], key, nullptr);
+        if (!handled)
+          handled = try_read_key(p, out.[:m:], key, nullptr, int_text_ok);
       } else if constexpr (has<flatten>(m) && map_like<M>) {
         // catch-all: only after every real field had its chance
       } else {
-        if (!handled && key == member_key<T>(m)) {
+        constexpr bool is_int_key = int_label(m).has_value();
+        if (!handled && (int_text_ok || !is_int_key) &&
+            key == member_key<T>(m)) {
           handled = true;
           read_member<m>(p, out.[:m:]);
           if (seen) seen[I] = true;
@@ -1198,11 +1222,17 @@ void read_struct(parser& p, T& out) {
   std::array<bool, members_of<T>().size()> seen{};
   parser::depth_guard g(p);
   p.expect('{');
+  // One set for EVERY key at this level — direct members, flattened members,
+  // catch-all entries, and skipped unknowns alike: all of them share one map,
+  // so all of them must be unique for the document to have one meaning.
+  std::unordered_set<std::string> level_keys;
   if (!p.consume('}')) {
     do {
       std::string key = p.parse_string();
       p.expect(':');
       path_guard where(p, key);
+      if (p.opts.reject_duplicate_keys && !level_keys.insert(key).second)
+        p.fail("duplicate key", errc::duplicate_field);
       if (!try_read_key(p, out, key, seen.data())) {
         if constexpr (has<deny_unknown_fields>(^^T)) p.fail("unknown field", errc::unknown_field);
         else p.skip_value();
@@ -1269,12 +1299,19 @@ void read_value(parser& p, T& out) {
       path_guard where(p, key);
       using K = typename T::key_type;
       if constexpr (string_like<K>) {
-        read_value(p, out[K(std::move(key))]);
+        K k(std::move(key));
+        // The container starts empty (clear() above), so a key already
+        // present can only be a duplicate in the document.
+        if (p.opts.reject_duplicate_keys && out.contains(k))
+          p.fail("duplicate key", errc::duplicate_field);
+        read_value(p, out[std::move(k)]);
       } else {  // integer key encoded as a JSON string
         K k{};
         auto [end, ec] = std::from_chars(key.data(), key.data() + key.size(), k);
         if (ec != std::errc{} || end != key.data() + key.size())
           p.fail("expected an integer map key", errc::type_mismatch);
+        if (p.opts.reject_duplicate_keys && out.contains(k))
+          p.fail("duplicate key", errc::duplicate_field);
         read_value(p, out[k]);
       }
     } while (p.consume(','));
@@ -1823,12 +1860,20 @@ void read_struct(cbor_reader& p, T& out) {
   cbor_reader::depth_guard g(p);
   auto h = p.head();
   if (h.major != 5) p.fail("expected an object", errc::type_mismatch);
+  // One set per key kind for EVERY key at this level — direct, flattened,
+  // catch-all, and skipped unknowns alike. Keys compare by decoded content
+  // (an int key and its text spelling stay two different keys; under
+  // no_substitutions the text spelling cannot even match — see try_read_key).
+  std::unordered_set<std::string> text_keys;
+  std::unordered_set<std::int64_t> int_keys;
   auto entry = [&] {
     auto kh = p.head();
     if (kh.major == 0 || kh.major == 1) {
       // Native integer key: COSE-style labels, matched against int_key fields.
       std::int64_t label = p.to_integer<std::int64_t>(kh);
       path_guard where(p, std::to_string(label));
+      if (p.opts.reject_duplicate_keys && !int_keys.insert(label).second)
+        p.fail("duplicate key", errc::duplicate_field);
       if (!try_read_int_key(p, out, label, seen.data())) {
         if constexpr (has<deny_unknown_fields>(^^T))
           p.fail("unknown field", errc::unknown_field);
@@ -1839,7 +1884,9 @@ void read_struct(cbor_reader& p, T& out) {
     if (kh.major != 3) p.fail("expected a map key", errc::type_mismatch);
     std::string key = p.text_body(kh);
     path_guard where(p, key);
-    if (!try_read_key(p, out, key, seen.data())) {
+    if (p.opts.reject_duplicate_keys && !text_keys.insert(key).second)
+      p.fail("duplicate key", errc::duplicate_field);
+    if (!try_read_key(p, out, key, seen.data(), !p.opts.no_substitutions)) {
       if constexpr (has<deny_unknown_fields>(^^T)) p.fail("unknown field", errc::unknown_field);
       else p.skip_value();
     }
@@ -1910,7 +1957,11 @@ void read_value(cbor_reader& p, T& out) {
       if constexpr (string_like<K>) {
         std::string key = p.text();
         path_guard where(p, key);
-        read_value(p, out[K(std::move(key))]);
+        K k(std::move(key));
+        // Empty at entry (clear() above): a present key is a document dupe.
+        if (p.opts.reject_duplicate_keys && out.contains(k))
+          p.fail("duplicate key", errc::duplicate_field);
+        read_value(p, out[std::move(k)]);
       } else {  // integer key: native, or text for JSON-converted documents
         auto kh = p.head();
         K k{};
@@ -1923,6 +1974,8 @@ void read_value(cbor_reader& p, T& out) {
           k = p.to_integer<K>(kh);
         }
         path_guard where(p, std::to_string(k));
+        if (p.opts.reject_duplicate_keys && out.contains(k))
+          p.fail("duplicate key", errc::duplicate_field);
         read_value(p, out[k]);
       }
     };
@@ -2263,8 +2316,9 @@ std::string to_json_pretty(const T& value, int indent = 2) {
 }
 
 template <typename T>
-std::expected<T, error> from_json(std::string_view json) {
-  detail::parser p{.in = json};
+std::expected<T, error> from_json(std::string_view json,
+                                  const json_options& opts = {}) {
+  detail::parser p{.in = json, .opts = opts};
   T value{};
   try {
     detail::read_value(p, value);
@@ -2284,8 +2338,9 @@ std::expected<T, error> from_json(std::string_view json) {
 // replaced whole. The overlay/patch primitive: defaults or an earlier
 // document first, this one on top.
 template <typename T>
-std::expected<void, error> from_json_into(std::string_view json, T& inout) {
-  detail::parser p{.in = json};
+std::expected<void, error> from_json_into(std::string_view json, T& inout,
+                                          const json_options& opts = {}) {
+  detail::parser p{.in = json, .opts = opts};
   try {
     detail::read_value(p, inout);
     p.skip_ws();

@@ -764,6 +764,86 @@ static void test_int_key() {
   EXPECT(jback.has_value() && jback->alg == -7);
 }
 
+static void test_duplicate_keys() {
+  constexpr sardine::json_options reject{.reject_duplicate_keys = true};
+
+  // Default: last occurrence wins, matching common JSON parsers.
+  auto lax = sardine::from_json<User>(R"({"user_id":1,"user_id":2,"name":"n"})");
+  EXPECT(lax.has_value() && lax->id == 2);
+  // Under the option the same document is one signature covering two
+  // meanings — refused.
+  auto dup =
+      sardine::from_json<User>(R"({"user_id":1,"user_id":2,"name":"n"})", reject);
+  EXPECT(!dup.has_value() && dup.error().code == sardine::errc::duplicate_field);
+  EXPECT_EQ(dup.error().path, "user_id");
+
+  // Duplicates inside a flattened level and among skipped unknowns count too.
+  auto flat = sardine::from_json<Doc>(
+      R"({"title":"t","version":1,"version":2})", reject);
+  EXPECT(!flat.has_value() &&
+         flat.error().code == sardine::errc::duplicate_field);
+  auto unk = sardine::from_json<User>(R"({"name":"n","w":1,"w":2})", reject);
+  EXPECT(!unk.has_value() && unk.error().code == sardine::errc::duplicate_field);
+
+  // Map targets, string- and int-keyed.
+  auto m = sardine::from_json<std::map<std::string, int>>(R"({"a":1,"a":2})",
+                                                          reject);
+  EXPECT(!m.has_value() && m.error().code == sardine::errc::duplicate_field);
+  auto ml = sardine::from_json<std::map<std::string, int>>(R"({"a":1,"a":2})");
+  EXPECT(ml.has_value() && ml->size() == 1uz && ml->at("a") == 2);
+  auto im = sardine::from_json<std::map<int, int>>(R"({"1":1,"1":2})", reject);
+  EXPECT(!im.has_value() && im.error().code == sardine::errc::duplicate_field);
+
+  // sardine::value keeps duplicates by design (a document is evidence);
+  // value is therefore not for signed wires.
+  auto v = sardine::from_json<sardine::value>(R"({"a":1,"a":2})", reject);
+  EXPECT(v.has_value() && v->as_object().size() == 2uz);
+
+  // CBOR: cbor_strict now rejects; the default profile keeps last-wins.
+  auto ct = sardine::from_cbor<std::map<std::string, int>>(
+      bytes({0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02}), sardine::cbor_strict);
+  EXPECT(!ct.has_value() && ct.error().code == sardine::errc::duplicate_field);
+  auto ctl = sardine::from_cbor<std::map<std::string, int>>(
+      bytes({0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02}));
+  EXPECT(ctl.has_value() && ctl->at("a") == 2);
+  auto ci = sardine::from_cbor<std::map<int, int>>(
+      bytes({0xa2, 0x01, 0x01, 0x01, 0x02}), sardine::cbor_strict);
+  EXPECT(!ci.has_value() && ci.error().code == sardine::errc::duplicate_field);
+  // Struct target with a repeated int_key label: {1: 2, 1: 2, 3: -7}.
+  auto ck = sardine::from_cbor<CoseKey>(
+      bytes({0xa3, 0x01, 0x02, 0x01, 0x02, 0x03, 0x26}), sardine::cbor_strict);
+  EXPECT(!ck.has_value() && ck.error().code == sardine::errc::duplicate_field);
+}
+
+static void test_int_key_text_spelling() {
+  // {1: 2, "3": -7}: under no_substitutions a text key must not match an
+  // int_key member's decimal spelling, so required alg goes unseen.
+  auto strict = sardine::from_cbor<CoseKey>(
+      bytes({0xa2, 0x01, 0x02, 0x61, '3', 0x26}), sardine::cbor_strict);
+  EXPECT(!strict.has_value() &&
+         strict.error().code == sardine::errc::missing_field);
+  // The lenient default keeps accepting the text spelling.
+  auto lax = sardine::from_cbor<CoseKey>(
+      bytes({0xa2, 0x01, 0x02, 0x61, '3', 0x26}));
+  EXPECT(lax.has_value() && lax->alg == -7);
+
+  // Both spellings in one map: {1: 2, 3: -7, "3": -100}. Strict skips the
+  // text one as an unknown key (it is a DIFFERENT key, not a duplicate);
+  // lenient last-wins lets it overwrite alg.
+  auto both = sardine::from_cbor<CoseKey>(
+      bytes({0xa3, 0x01, 0x02, 0x03, 0x26, 0x61, '3', 0x38, 0x63}),
+      sardine::cbor_strict);
+  EXPECT(both.has_value() && both->alg == -7);
+  auto overwrite = sardine::from_cbor<CoseKey>(
+      bytes({0xa3, 0x01, 0x02, 0x03, 0x26, 0x61, '3', 0x38, 0x63}));
+  EXPECT(overwrite.has_value() && overwrite->alg == -100);
+
+  // JSON is unaffected: its keys are only ever text.
+  auto j = sardine::from_json<CoseKey>(R"({"1":2,"3":-7})",
+                                       {.reject_duplicate_keys = true});
+  EXPECT(j.has_value() && j->kty == 2 && j->alg == -7);
+}
+
 static void test_cbor_raw() {
   struct Att {
     std::string fmt;
@@ -910,6 +990,8 @@ int main() {
   test_cbor_wellformedness();
   test_cbor_bytes();
   test_int_key();
+  test_duplicate_keys();
+  test_int_key_text_spelling();
   test_cbor_raw();
   test_value_tree();
   test_from_json_into();
