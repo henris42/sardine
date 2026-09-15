@@ -1087,6 +1087,51 @@ static void test_untagged_budget() {
   EXPECT(sardine::from_json<H>(doc).has_value());
 }
 
+static void test_error_path_hygiene() {
+  // A huge key cannot become a huge log line: segments cap at 64 bytes + "…".
+  std::string doc = "{\"" + std::string(100'000, 'k') + "\": nope}";
+  auto e = sardine::from_json<sardine::value>(doc);
+  EXPECT(!e.has_value());
+  EXPECT_EQ(e.error().path.size(), 67uz);  // 64 bytes + 3-byte ellipsis
+
+  // The joined path caps too, ellipsis at a UTF-8 boundary.
+  std::string k(64, 'q'), deep_doc, tail;
+  for (int i = 0; i < 30; ++i) { deep_doc += "{\"" + k + "\":"; tail += '}'; }
+  auto d = sardine::from_json<sardine::value>(deep_doc + "nope" + tail);
+  EXPECT(!d.has_value());
+  EXPECT(d.error().path.size() <= 1030uz);
+
+  // redact_paths: document keys become <key>; schema names and indices stay.
+  struct Item { std::map<std::string, int> m; };
+  struct Holder { std::vector<Item> items; };
+  sardine::json_options redact{.redact_paths = true};
+  auto r = sardine::from_json<Holder>(
+      R"({"items":[{"m":{"secret-token":"x"}}]})", redact);
+  EXPECT(!r.has_value() && r.error().code == sardine::errc::type_mismatch);
+  EXPECT_EQ(r.error().path, "items.0.m.<key>");
+  // A key that matches a member is the program's name, not the document's.
+  auto t = sardine::from_json<User>(R"({"name":12})", redact);
+  EXPECT(!t.has_value());
+  EXPECT_EQ(t.error().path, "name");
+  // Unknown keys are document text: redacted in the unknown_field error.
+  sardine::json_options redact_deny{.deny_unknown_fields = true,
+                                    .redact_paths = true};
+  auto u = sardine::from_json<User>(R"({"powned":1})", redact_deny);
+  EXPECT(!u.has_value() && u.error().code == sardine::errc::unknown_field);
+  EXPECT_EQ(u.error().path, "<key>");
+  // Flattened catch-all entries are document text too.
+  auto f = sardine::from_json<Doc>(R"({"title":"t","x":1})", redact);
+  EXPECT(!f.has_value());
+  EXPECT_EQ(f.error().path, "<key>");
+
+  // CBOR carries the same behavior.
+  sardine::cbor_options credact{.redact_paths = true};
+  auto c = sardine::from_cbor<std::map<std::string, int>>(
+      bytes({0xa1, 0x61, 's', 0x61, 'x'}), credact);
+  EXPECT(!c.has_value());
+  EXPECT_EQ(c.error().path, "<key>");
+}
+
 static void test_decoder_wide_deny() {
   constexpr sardine::json_options strict{.deny_unknown_fields = true};
   // The option closes types that forgot the annotation...
@@ -1154,6 +1199,7 @@ int main() {
   test_decode_limits();
   test_untagged_budget();
   test_decoder_wide_deny();
+  test_error_path_hygiene();
 
   if (failures == 0) std::println("all tests passed");
   else std::println("{} FAILURES", failures);

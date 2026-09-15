@@ -221,6 +221,8 @@ struct cbor_options {
                                   // decoder is deliberately liberal)
   bool deny_unknown_fields = false;  // decoder-wide: unknown struct keys fail
                                      // unless the type says allow_unknown_fields
+  bool redact_paths = false;  // error.path shows "<key>" instead of document
+                              // key text (indices and schema names stay)
   limits lim{};
 };
 
@@ -244,6 +246,9 @@ struct json_options {
   bool reject_duplicate_keys = false;
   bool validate_utf8 = true;           // RFC 8259 §8.1; off is the odd case
   bool strict_numbers = true;          // RFC 8259 §6 grammar, not from_chars's
+  bool redact_paths = false;           // error.path shows "<key>" instead of
+                                       // document key text (indices and schema
+                                       // names stay)
 };
 
 // Exactly one CBOR data item, kept as its verbatim bytes. Reading validates
@@ -819,6 +824,20 @@ struct parse_error {
   std::string path;
 };
 
+// Paths are built from attacker-supplied key text and end up in logs, so
+// they are bounded: each segment caps at max_path_segment bytes and the
+// joined path at max_path_total, cut at a UTF-8 boundary and marked "…".
+inline constexpr std::size_t max_path_segment = 64;
+inline constexpr std::size_t max_path_total = 1024;
+
+inline void truncate_segment(std::string& s, std::size_t cap) {
+  if (s.size() <= cap) return;
+  std::size_t cut = cap;
+  while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+  s.resize(cut);
+  s += "…";
+}
+
 // Both readers keep a stack of where they are in the document (object keys,
 // array indices); errors report it dotted. The guard pops on scope exit —
 // including during unwinding, which is why fail() joins first.
@@ -827,14 +846,28 @@ inline std::string joined_path(const std::vector<std::string>& segs) {
   for (const auto& s : segs) {
     if (!out.empty()) out += '.';
     out += s;
+    if (out.size() > max_path_total) {
+      truncate_segment(out, max_path_total);
+      break;
+    }
   }
   return out;
 }
 
+// `is_key` marks a segment that is document KEY TEXT (attacker-controlled,
+// possibly sensitive) rather than an index or a schema name; under
+// redact_paths those become "<key>". Struct readers push matched member
+// names un-marked — they are the program's text — and overwrite the segment
+// with "<key>" only when the key turns out to be unknown or lands in a
+// flattened catch-all map.
 template <typename P>
 struct path_guard {
   P& p;
-  path_guard(P& p, std::string seg) : p(p) { p.path.push_back(std::move(seg)); }
+  path_guard(P& p, std::string seg, bool is_key = false) : p(p) {
+    if (is_key && p.opts.redact_paths) seg = "<key>";
+    else truncate_segment(seg, max_path_segment);
+    p.path.push_back(std::move(seg));
+  }
   ~path_guard() { p.path.pop_back(); }
 };
 
@@ -1052,7 +1085,7 @@ inline void read_document(parser& p, value& out) {
           p.fail("too many elements", errc::limit_exceeded);
         std::string k = p.parse_string();
         p.expect(':');
-        path_guard where(p, k);
+        path_guard where(p, k, /*is_key=*/true);
         value v;
         read_document(p, v);
         o.emplace_back(std::move(k), std::move(v));
@@ -1280,6 +1313,8 @@ bool try_read_key(P& p, T& out, std::string_view key, bool* seen,
       if constexpr (has<flatten>(m) && map_like<M>) {
         if (!handled) {
           handled = true;
+          // Catch-all entries are document text, not schema text.
+          if (p.opts.redact_paths && !p.path.empty()) p.path.back() = "<key>";
           auto& map = out.[:m:];
           read_value(p, map[typename M::key_type(std::string(key))]);
         }
@@ -1352,6 +1387,8 @@ void read_struct(parser& p, T& out) {
       if (p.opts.reject_duplicate_keys && !level_keys.insert(key).second)
         p.fail("duplicate key", errc::duplicate_field);
       if (!try_read_key(p, out, key, seen.data())) {
+        // The key matched no member, so it is document text, not schema text.
+        if (p.opts.redact_paths) p.path.back() = "<key>";
         constexpr bool denies = has<deny_unknown_fields>(^^T);
         constexpr bool allows = has<allow_unknown_fields>(^^T);
         if (denies || (p.opts.deny_unknown_fields && !allows))
@@ -1421,8 +1458,9 @@ void read_value(parser& p, T& out) {
         p.fail("too many elements", errc::limit_exceeded);
       std::string key = p.parse_string();
       p.expect(':');
-      path_guard where(p, key);
       using K = typename T::key_type;
+      // Text map keys are document data; integer keys read like indices.
+      path_guard where(p, key, /*is_key=*/string_like<K>);
       if constexpr (string_like<K>) {
         K k(std::move(key));
         // The container starts empty (clear() above), so a key already
@@ -2079,8 +2117,11 @@ void read_struct(cbor_reader& p, T& out) {
     path_guard where(p, key);
     if (p.opts.reject_duplicate_keys && !text_keys.insert(key).second)
       p.fail("duplicate key", errc::duplicate_field);
-    if (!try_read_key(p, out, key, seen.data(), !p.opts.no_substitutions))
+    if (!try_read_key(p, out, key, seen.data(), !p.opts.no_substitutions)) {
+      // The key matched no member, so it is document text, not schema text.
+      if (p.opts.redact_paths) p.path.back() = "<key>";
       unknown();
+    }
   };
   if (h.indefinite()) { while (!p.try_break()) entry(); }
   else for (std::uint64_t i = 0; i < h.value; ++i) entry();
@@ -2150,7 +2191,7 @@ void read_value(cbor_reader& p, T& out) {
       using K = typename T::key_type;
       if constexpr (string_like<K>) {
         std::string key = p.text();
-        path_guard where(p, key);
+        path_guard where(p, key, /*is_key=*/true);
         K k(std::move(key));
         // Empty at entry (clear() above): a present key is a document dupe.
         if (p.opts.reject_duplicate_keys && out.contains(k))
