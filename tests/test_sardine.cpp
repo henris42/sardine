@@ -963,6 +963,158 @@ static void test_omit_none_and_emit_null() {
   EXPECT(back.has_value() && !back->a && !back->b);
 }
 
+static void test_strict_numbers() {
+  // std::from_chars takes all of these; RFC 8259 §6 takes none.
+  for (auto bad : {"01", "1.", ".5", "+1", "1.e5", "-", "00", "-01", "1e"}) {
+    auto d = sardine::from_json<double>(bad);
+    EXPECT(!d.has_value() && d.error().code == sardine::errc::invalid_number);
+    auto v = sardine::from_json<sardine::value>(bad);
+    EXPECT(!v.has_value() && v.error().code == sardine::errc::invalid_number);
+  }
+  for (auto good : {"-0", "1e-7", "1E+2", "0.5", "-12.75e+1", "0"}) {
+    EXPECT(sardine::from_json<double>(good).has_value());
+  }
+  // The lenient path stays available for hand-written config files.
+  sardine::json_options lax{.strict_numbers = false};
+  auto l = sardine::from_json<double>("01", lax);
+  EXPECT(l.has_value() && *l == 1.0);
+}
+
+static void test_utf8_validation() {
+  // Overlong NUL, surrogate half, above U+10FFFF, truncated lead byte.
+  static constexpr const char* invalid[] = {
+      "\"\xC0\x80\"", "\"\xED\xA0\x80\"", "\"\xF4\x90\x80\x80\"", "\"\xC3\""};
+  for (auto bad : invalid) {
+    auto s = sardine::from_json<std::string>(bad);
+    EXPECT(!s.has_value() &&
+           s.error().code == sardine::errc::invalid_encoding);
+  }
+  // Off is the odd case, but available.
+  sardine::json_options lax{.validate_utf8 = false};
+  EXPECT(sardine::from_json<std::string>("\"\xC0\x80\"", lax).has_value());
+  // Valid 4-byte sequences round-trip (already exercised elsewhere with 🍕).
+  auto ok = sardine::from_json<std::string>("\"\xF0\x9F\x8D\x95\"");
+  EXPECT(ok.has_value() && *ok == "\U0001F355");
+
+  // CBOR: the default profile stays liberal; cbor_strict validates.
+  auto cbad = bytes({0x62, 0xC0, 0x80});  // text(2) of invalid bytes
+  EXPECT(sardine::from_cbor<std::string>(cbad).has_value());
+  auto cs = sardine::from_cbor<std::string>(cbad, sardine::cbor_strict);
+  EXPECT(!cs.has_value() && cs.error().code == sardine::errc::invalid_encoding);
+  // Validation reaches SKIPPED values too (unknown keys, cbor_raw).
+  auto craw = sardine::from_cbor<sardine::cbor_raw>(cbad, sardine::cbor_strict);
+  EXPECT(!craw.has_value() &&
+         craw.error().code == sardine::errc::invalid_encoding);
+  // A character may not straddle indefinite-text chunks (RFC 8949 §3.2.3):
+  // "é" split as C3 | A9 is invalid even though the concatenation is fine.
+  sardine::cbor_options utf8_only{.validate_utf8 = true};
+  auto split = sardine::from_cbor<std::string>(
+      bytes({0x7f, 0x61, 0xC3, 0x61, 0xA9, 0xff}), utf8_only);
+  EXPECT(!split.has_value() &&
+         split.error().code == sardine::errc::invalid_encoding);
+  auto whole = sardine::from_cbor<std::string>(
+      bytes({0x7f, 0x62, 0xC3, 0xA9, 0xff}), utf8_only);
+  EXPECT(whole.has_value() && *whole == "é");
+}
+
+static void test_decode_limits() {
+  using sardine::errc;
+  // Depth stays its own error and is now configurable.
+  sardine::json_options shallow{.lim = {.max_depth = 3}};
+  EXPECT(sardine::from_json<sardine::value>("[[[1]]]", shallow).has_value());
+  auto deep = sardine::from_json<sardine::value>("[[[[1]]]]", shallow);
+  EXPECT(!deep.has_value() && deep.error().code == errc::depth_exceeded);
+
+  // One string's decoded bytes.
+  sardine::json_options tiny_str{.lim = {.max_string_bytes = 4}};
+  auto s = sardine::from_json<std::string>("\"abcdefgh\"", tiny_str);
+  EXPECT(!s.has_value() && s.error().code == errc::limit_exceeded);
+  sardine::cbor_options ctiny{.lim = {.max_string_bytes = 4}};
+  auto cs = sardine::from_cbor<std::string>(
+      bytes({0x65, 'a', 'b', 'c', 'd', 'e'}), ctiny);
+  EXPECT(!cs.has_value() && cs.error().code == errc::limit_exceeded);
+  auto cb = sardine::from_cbor<std::vector<std::uint8_t>>(
+      bytes({0x45, 1, 2, 3, 4, 5}), ctiny);
+  EXPECT(!cb.has_value() && cb.error().code == errc::limit_exceeded);
+
+  // Elements in one container; a definite CBOR length is refused up front,
+  // before any element is read.
+  sardine::json_options few{.lim = {.max_elements = 3}};
+  auto a = sardine::from_json<std::vector<int>>("[1,2,3,4]", few);
+  EXPECT(!a.has_value() && a.error().code == errc::limit_exceeded);
+  EXPECT(sardine::from_json<std::vector<int>>("[1,2,3]", few).has_value());
+  sardine::cbor_options cfew{.lim = {.max_elements = 3}};
+  auto ca = sardine::from_cbor<std::vector<int>>(
+      bytes({0x84, 1, 2, 3, 4}), cfew);
+  EXPECT(!ca.has_value() && ca.error().code == errc::limit_exceeded);
+  auto claim = sardine::from_cbor<std::vector<int>>(
+      bytes({0x9a, 0x00, 0x10, 0x00, 0x00}), cfew);  // array(1M), no elements
+  EXPECT(!claim.has_value() && claim.error().code == errc::limit_exceeded);
+  auto cind = sardine::from_cbor<std::vector<int>>(
+      bytes({0x9f, 1, 2, 3, 4, 0xff}), cfew);
+  EXPECT(!cind.has_value() && cind.error().code == errc::limit_exceeded);
+
+  // Whole-document item budget, including skipped values.
+  sardine::json_options total{.lim = {.max_total_items = 8}};
+  auto t = sardine::from_json<sardine::value>("[1,2,3,4,5,6,7,8,9]", total);
+  EXPECT(!t.has_value() && t.error().code == errc::limit_exceeded);
+  auto skip = sardine::from_json<User>(
+      R"({"unknown":[1,2,3,4,5,6,7,8,9]})", total);
+  EXPECT(!skip.has_value() && skip.error().code == errc::limit_exceeded);
+  sardine::cbor_options ctotal{.lim = {.max_total_items = 4}};
+  auto ct = sardine::from_cbor<std::vector<int>>(
+      bytes({0x85, 1, 2, 3, 4, 5}), ctotal);
+  EXPECT(!ct.has_value() && ct.error().code == errc::limit_exceeded);
+}
+
+static void test_untagged_budget() {
+  // An untagged variant's failed alternatives burn max_total_items budget,
+  // so hostile documents cannot multiply re-parses for free (D-7).
+  struct H {
+    [[=sardine::untagged{}]] std::variant<std::vector<int>, std::vector<double>>
+        u;
+  };
+  std::string doc = R"({"u":[1,2,3,4,5,6,7,8,9,1.5]})";
+  sardine::json_options tight{.lim = {.max_total_items = 16}};
+  // The winning parse alone fits the budget comfortably...
+  auto direct = sardine::from_json<std::vector<double>>(
+      "[1,2,3,4,5,6,7,8,9,1.5]", tight);
+  EXPECT(direct.has_value());
+  // ...but after the failed std::vector<int> attempt it no longer does.
+  auto burned = sardine::from_json<H>(doc, tight);
+  EXPECT(!burned.has_value() &&
+         burned.error().code == sardine::errc::limit_exceeded);
+  EXPECT(sardine::from_json<H>(doc).has_value());
+}
+
+static void test_decoder_wide_deny() {
+  constexpr sardine::json_options strict{.deny_unknown_fields = true};
+  // The option closes types that forgot the annotation...
+  auto u = sardine::from_json<User>(R"({"user_id":1,"zz":2})", strict);
+  EXPECT(!u.has_value() && u.error().code == sardine::errc::unknown_field);
+  EXPECT_EQ(u.error().path, "zz");
+  EXPECT(sardine::from_json<User>(R"({"user_id":1})", strict).has_value());
+  // ...while allow_unknown_fields opts a pass-through type back out.
+  struct [[=sardine::allow_unknown_fields{}]] Open { int a = 0; };
+  auto o = sardine::from_json<Open>(R"({"a":1,"b":2})", strict);
+  EXPECT(o.has_value() && o->a == 1);
+  // A flattened catch-all map still absorbs unknowns: they are not unknown.
+  auto d = sardine::from_json<Doc>(R"({"title":"t","x":"1"})", strict);
+  EXPECT(d.has_value() && d->extra.at("x") == "1");
+
+  // CBOR side: {"a": 1, "zz": 2} against Open/plain struct.
+  constexpr sardine::cbor_options cstrict{.deny_unknown_fields = true};
+  struct Plain { int a = 0; };
+  auto wire = bytes({0xa2, 0x61, 'a', 0x01, 0x62, 'z', 'z', 0x02});
+  auto cp = sardine::from_cbor<Plain>(wire, cstrict);
+  EXPECT(!cp.has_value() && cp.error().code == sardine::errc::unknown_field);
+  auto co = sardine::from_cbor<Open>(wire, cstrict);
+  EXPECT(co.has_value() && co->a == 1);
+  // Unknown int labels are unknown fields too.
+  auto ci = sardine::from_cbor<Plain>(bytes({0xa1, 0x07, 0x01}), cstrict);
+  EXPECT(!ci.has_value() && ci.error().code == sardine::errc::unknown_field);
+}
+
 int main() {
   test_basic_roundtrip();
   test_pretty_json();
@@ -997,6 +1149,11 @@ int main() {
   test_from_json_into();
   test_cbor_prefix();
   test_omit_none_and_emit_null();
+  test_strict_numbers();
+  test_utf8_validation();
+  test_decode_limits();
+  test_untagged_budget();
+  test_decoder_wide_deny();
 
   if (failures == 0) std::println("all tests passed");
   else std::println("{} FAILURES", failures);

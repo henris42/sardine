@@ -99,6 +99,12 @@ struct emit_null {};
 // error instead of being ignored.
 struct deny_unknown_fields {};
 
+// [[=sardine::allow_unknown_fields{}]] — on a struct: unknown keys are
+// skipped even under the decoder-wide deny_unknown_fields OPTION, so the
+// option can be on globally with the rare pass-through type opting out.
+// The per-type deny annotation still wins when both are present.
+struct allow_unknown_fields {};
+
 // [[=sardine::enum_from_number{}]] — on an enum: reading accepts the numeric
 // underlying value as well as enumerator names. Without it a number where an
 // enum belongs is a type error: names are the wire format, and a stray
@@ -162,8 +168,10 @@ enum class errc : std::uint8_t {
   unknown_enum,      // string is not an enumerator name
   unknown_variant,   // no variant alternative matched / unknown tag
   out_of_range,      // number does not fit the destination type
-  invalid_encoding,  // CBOR: reserved bits, bad chunks, or a strict-profile refusal
+  invalid_encoding,  // reserved bits, bad chunks, invalid UTF-8, or a
+                     // strict-profile refusal
   duplicate_field,   // a map/object key occurred twice (reject_duplicate_keys)
+  limit_exceeded,    // a limits{} budget was exhausted
 };
 
 struct error {
@@ -186,6 +194,19 @@ struct error {
 // lengths and no tags, but authenticators do emit non-minimal heads).
 // ---------------------------------------------------------------------------
 
+// Per-decode resource budgets, shared by both readers. Untrusted input gets
+// a budget, not trust: each limit fails the decode with errc::limit_exceeded
+// (depth keeps its own errc::depth_exceeded) instead of growing memory, the
+// stack, or CPU time in proportion to what the document claims.
+struct limits {
+  int max_depth = 256;                       // nesting levels
+  std::size_t max_string_bytes = 16u << 20;  // one decoded string/byte string
+  std::size_t max_elements = 1u << 20;       // entries in one container
+  std::size_t max_total_items = 4u << 20;    // values in the whole document —
+                                             // skipped values and every retry
+                                             // an untagged variant burns count
+};
+
 struct cbor_options {
   bool minimal_heads    = false;  // reject non-minimal argument encodings
   bool definite_only    = false;  // reject indefinite-length strings/arrays/maps
@@ -195,6 +216,12 @@ struct cbor_options {
                                   // and undefined-as-null
   bool reject_duplicate_keys = false;  // a repeated map key is an error, not
                                        // last-wins (RFC 8949 §5.6 strictness)
+  bool validate_utf8    = false;  // reject text strings that are not UTF-8
+                                  // (RFC 8949 §3.1 requires it; the default
+                                  // decoder is deliberately liberal)
+  bool deny_unknown_fields = false;  // decoder-wide: unknown struct keys fail
+                                     // unless the type says allow_unknown_fields
+  limits lim{};
 };
 
 // RFC 8949 §4.2-shaped strictness (heads and lengths; key ORDER stays the
@@ -203,14 +230,20 @@ inline constexpr cbor_options cbor_strict{.minimal_heads = true,
                                           .definite_only = true,
                                           .no_tags = true,
                                           .no_substitutions = true,
-                                          .reject_duplicate_keys = true};
+                                          .reject_duplicate_keys = true,
+                                          .validate_utf8 = true};
 
-// Options for the JSON reader (from_json / from_json_into). The default
-// decoder stays liberal about duplicates — last occurrence wins, matching
-// most JSON parsers — because rejecting them is a wire-contract decision,
-// not a well-formedness one (RFC 8259 leaves the behavior open).
+// Options for the JSON reader (from_json / from_json_into). The defaults
+// enforce what RFC 8259 requires of the DOCUMENT (UTF-8, the number grammar)
+// and stay liberal where the RFC leaves behavior open (duplicate keys:
+// last occurrence wins, matching most JSON parsers — rejecting them is a
+// wire-contract decision, not a well-formedness one).
 struct json_options {
+  limits lim{};
+  bool deny_unknown_fields = false;    // decoder-wide, ORs with the annotation
   bool reject_duplicate_keys = false;
+  bool validate_utf8 = true;           // RFC 8259 §8.1; off is the odd case
+  bool strict_numbers = true;          // RFC 8259 §6 grammar, not from_chars's
 };
 
 // Exactly one CBOR data item, kept as its verbatim bytes. Reading validates
@@ -460,6 +493,57 @@ consteval std::string_view alt_name() {
 // ---------------------------------------------------------------------------
 // Shared text helpers.
 // ---------------------------------------------------------------------------
+
+// True iff `s` is well-formed UTF-8 (RFC 3629): no overlong encodings, no
+// surrogate code points, nothing above U+10FFFF, no truncated sequences.
+inline bool valid_utf8(std::string_view s) {
+  const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+  const auto* end = p + s.size();
+  while (p < end) {
+    unsigned char c = *p++;
+    if (c < 0x80) continue;
+    int cont;
+    std::uint32_t cp, min;
+    if ((c & 0xE0) == 0xC0) { cont = 1; cp = c & 0x1Fu; min = 0x80; }
+    else if ((c & 0xF0) == 0xE0) { cont = 2; cp = c & 0x0Fu; min = 0x800; }
+    else if ((c & 0xF8) == 0xF0) { cont = 3; cp = c & 0x07u; min = 0x10000; }
+    else return false;  // stray continuation byte or 0xF8.. lead
+    if (end - p < cont) return false;
+    for (int i = 0; i < cont; ++i) {
+      unsigned char t = *p++;
+      if ((t & 0xC0) != 0x80) return false;
+      cp = cp << 6 | (t & 0x3Fu);
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+      return false;
+  }
+  return true;
+}
+
+// The RFC 8259 §6 number grammar:
+//   -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+// std::from_chars is looser (01, 1., 1.e5), and a number another parser
+// refuses is a differential on signed or hashed bodies.
+inline bool rfc8259_number(std::string_view t) {
+  std::size_t i = 0;
+  auto digit = [&](std::size_t j) { return j < t.size() && t[j] >= '0' && t[j] <= '9'; };
+  if (i < t.size() && t[i] == '-') ++i;
+  if (!digit(i)) return false;
+  if (t[i] == '0') ++i;
+  else while (digit(i)) ++i;
+  if (i < t.size() && t[i] == '.') {
+    ++i;
+    if (!digit(i)) return false;
+    while (digit(i)) ++i;
+  }
+  if (i < t.size() && (t[i] == 'e' || t[i] == 'E')) {
+    ++i;
+    if (i < t.size() && (t[i] == '+' || t[i] == '-')) ++i;
+    if (!digit(i)) return false;
+    while (digit(i)) ++i;
+  }
+  return i == t.size();
+}
 
 inline void escape_into(std::string& out, std::string_view s) {
   out += '"';
@@ -758,12 +842,20 @@ struct parser {
   std::string_view in{};
   std::size_t pos = 0;
   int depth = 0;
+  std::size_t total_items = 0;
   std::vector<std::string> path{};
   json_options opts{};
-  static constexpr int max_depth = 256;
 
   [[noreturn]] void fail(const char* msg, errc code = errc::syntax) const {
     throw parse_error{msg, pos, code, joined_path(path)};
+  }
+
+  // Whole-document work budget: every value read OR skipped counts once —
+  // including every re-parse an untagged variant burns, which is what bounds
+  // that mode's k^d backtracking on hostile input.
+  void count_item() {
+    if (++total_items > opts.lim.max_total_items)
+      fail("too many items in document", errc::limit_exceeded);
   }
 
   void skip_ws() {
@@ -796,7 +888,8 @@ struct parser {
   struct depth_guard {
     parser& p;
     explicit depth_guard(parser& p) : p(p) {
-      if (++p.depth > max_depth) p.fail("nesting too deep", errc::depth_exceeded);
+      if (++p.depth > p.opts.lim.max_depth)
+        p.fail("nesting too deep", errc::depth_exceeded);
     }
     ~depth_guard() { --p.depth; }
   };
@@ -837,9 +930,17 @@ struct parser {
     expect('"');
     std::string out;
     while (true) {
+      if (out.size() > opts.lim.max_string_bytes)
+        fail("string too long", errc::limit_exceeded);
       if (pos >= in.size()) fail("unterminated string", errc::truncated);
       char c = in[pos++];
-      if (c == '"') return out;
+      if (c == '"') {
+        // Escapes emit valid sequences by construction; this checks the raw
+        // bytes that passed through (RFC 8259 §8.1 requires UTF-8).
+        if (opts.validate_utf8 && !valid_utf8(out))
+          fail("invalid UTF-8 in string", errc::invalid_encoding);
+        return out;
+      }
       if (c == '\\') {
         if (pos >= in.size()) fail("unterminated escape", errc::truncated);
         char e = in[pos++];
@@ -896,12 +997,18 @@ struct parser {
         fail("expected a number", errc::type_mismatch);
       fail("expected a number");
     }
-    return in.substr(start, pos - start);
+    std::string_view tok = in.substr(start, pos - start);
+    if (opts.strict_numbers && !rfc8259_number(tok)) {
+      pos = start;  // report at the number, not past it
+      fail("invalid number", errc::invalid_number);
+    }
+    return tok;
   }
 
   // Consume any well-formed value without storing it (for unknown keys).
   void skip_value() {
     depth_guard g(*this);
+    count_item();
     char c = peek();
     if (c == '"') { parse_string(); return; }
     if (c == '{') {
@@ -929,6 +1036,7 @@ void read_value(parser& p, T& out);
 // Parse ANY JSON document into a sardine::value tree. Duplicate keys and
 // insertion order survive; oversized integers degrade to double.
 inline void read_document(parser& p, value& out) {
+  p.count_item();
   char c = p.peek();
   if (c == '"') {
     out = value(p.parse_string());
@@ -940,6 +1048,8 @@ inline void read_document(parser& p, value& out) {
     value::object o;
     if (!p.consume('}')) {
       do {
+        if (o.size() >= p.opts.lim.max_elements)
+          p.fail("too many elements", errc::limit_exceeded);
         std::string k = p.parse_string();
         p.expect(':');
         path_guard where(p, k);
@@ -959,6 +1069,8 @@ inline void read_document(parser& p, value& out) {
     if (!p.consume(']')) {
       std::size_t index = 0;
       do {
+        if (index >= p.opts.lim.max_elements)
+          p.fail("too many elements", errc::limit_exceeded);
         path_guard where(p, std::to_string(index++));
         read_document(p, a.emplace_back());
       } while (p.consume(','));
@@ -1053,7 +1165,10 @@ void read_variant_untagged(P& p, V& out) {
         read_value(p, tmp);
         out.template emplace<I>(std::move(tmp));
         matched = true;
-      } catch (const parse_error&) {
+      } catch (const parse_error& e) {
+        // Budgets are monotonic across rewinds — no later alternative can
+        // succeed, and "unknown variant" would hide the real cause.
+        if (e.code == errc::limit_exceeded) throw;
         p.pos = save;
         p.path.resize(path_save);
       }
@@ -1227,14 +1342,20 @@ void read_struct(parser& p, T& out) {
   // so all of them must be unique for the document to have one meaning.
   std::unordered_set<std::string> level_keys;
   if (!p.consume('}')) {
+    std::size_t entries = 0;
     do {
+      if (++entries > p.opts.lim.max_elements)
+        p.fail("too many elements", errc::limit_exceeded);
       std::string key = p.parse_string();
       p.expect(':');
       path_guard where(p, key);
       if (p.opts.reject_duplicate_keys && !level_keys.insert(key).second)
         p.fail("duplicate key", errc::duplicate_field);
       if (!try_read_key(p, out, key, seen.data())) {
-        if constexpr (has<deny_unknown_fields>(^^T)) p.fail("unknown field", errc::unknown_field);
+        constexpr bool denies = has<deny_unknown_fields>(^^T);
+        constexpr bool allows = has<allow_unknown_fields>(^^T);
+        if (denies || (p.opts.deny_unknown_fields && !allows))
+          p.fail("unknown field", errc::unknown_field);
         else p.skip_value();
       }
     } while (p.consume(','));
@@ -1245,6 +1366,7 @@ void read_struct(parser& p, T& out) {
 
 template <typename T>
 void read_value(parser& p, T& out) {
+  p.count_item();
   if constexpr (std::same_as<T, bool>) {
     if (p.consume_word("true")) out = true;
     else if (p.consume_word("false")) out = false;
@@ -1293,7 +1415,10 @@ void read_value(parser& p, T& out) {
     p.expect('{');
     out.clear();
     if (p.consume('}')) return;
+    std::size_t entries = 0;
     do {
+      if (++entries > p.opts.lim.max_elements)
+        p.fail("too many elements", errc::limit_exceeded);
       std::string key = p.parse_string();
       p.expect(':');
       path_guard where(p, key);
@@ -1323,6 +1448,8 @@ void read_value(parser& p, T& out) {
     if (p.consume(']')) return;
     std::size_t index = 0;
     do {
+      if (index >= p.opts.lim.max_elements)
+        p.fail("too many elements", errc::limit_exceeded);
       path_guard where(p, std::to_string(index++));
       read_value(p, out.emplace_back());
     } while (p.consume(','));
@@ -1572,18 +1699,27 @@ struct cbor_reader {
   std::span<const std::uint8_t> in{};
   std::size_t pos = 0;
   int depth = 0;
+  std::size_t total_items = 0;
   std::vector<std::string> path{};
   cbor_options opts{};
-  static constexpr int max_depth = 256;
 
   [[noreturn]] void fail(const char* msg, errc code = errc::syntax) const {
     throw parse_error{msg, pos, code, joined_path(path)};
   }
 
+  // Whole-document work budget: every item read OR skipped counts once —
+  // including every re-parse an untagged variant burns, which is what bounds
+  // that mode's k^d backtracking on hostile input.
+  void count_item() {
+    if (++total_items > opts.lim.max_total_items)
+      fail("too many items in document", errc::limit_exceeded);
+  }
+
   struct depth_guard {
     cbor_reader& p;
     explicit depth_guard(cbor_reader& p) : p(p) {
-      if (++p.depth > max_depth) p.fail("nesting too deep", errc::depth_exceeded);
+      if (++p.depth > p.opts.lim.max_depth)
+        p.fail("nesting too deep", errc::depth_exceeded);
     }
     ~depth_guard() { --p.depth; }
   };
@@ -1603,6 +1739,22 @@ struct cbor_reader {
     std::uint8_t ai;      // additional info, before argument expansion
     std::uint64_t value;  // argument: int value, length, tag, float bits
     bool indefinite() const { return ai == 31; }
+  };
+
+  // limits::max_elements for one container: a definite length is refused up
+  // front (before any per-entry work the claimed size would drive); an
+  // indefinite one as its entries accumulate.
+  struct element_budget {
+    cbor_reader& p;
+    std::uint64_t n = 0;
+    element_budget(cbor_reader& p, const item& h) : p(p) {
+      if (!h.indefinite() && h.value > p.opts.lim.max_elements)
+        p.fail("too many elements", errc::limit_exceeded);
+    }
+    void tick() {
+      if (++n > p.opts.lim.max_elements)
+        p.fail("too many elements", errc::limit_exceeded);
+    }
   };
 
   item raw_head() {
@@ -1665,18 +1817,32 @@ struct cbor_reader {
 
   std::string chunk(std::uint64_t n) {
     if (n > in.size() - pos) fail("truncated string", errc::truncated);
+    if (n > opts.lim.max_string_bytes)
+      fail("string too long", errc::limit_exceeded);
     std::string s(reinterpret_cast<const char*>(in.data() + pos), std::size_t(n));
     pos += std::size_t(n);
     return s;
   }
 
+  // RFC 8949 §3.2.3: every chunk of an indefinite text string must itself be
+  // well-formed UTF-8 (a character cannot straddle chunks), so validation is
+  // per chunk, not on the concatenation.
+  std::string take_text(std::uint64_t n) {
+    std::string s = chunk(n);
+    if (opts.validate_utf8 && !valid_utf8(s))
+      fail("invalid UTF-8 in text string", errc::invalid_encoding);
+    return s;
+  }
+
   std::string text_body(item h) {
-    if (!h.indefinite()) return chunk(h.value);
+    if (!h.indefinite()) return take_text(h.value);
     std::string s;
     while (!try_break()) {
       item c = raw_head();  // chunks: definite text strings, no tags
       if (c.major != 3 || c.indefinite()) fail("bad text string chunk", errc::invalid_encoding);
-      s += chunk(c.value);
+      s += take_text(c.value);
+      if (s.size() > opts.lim.max_string_bytes)
+        fail("string too long", errc::limit_exceeded);
     }
     return s;
   }
@@ -1744,32 +1910,54 @@ struct cbor_reader {
   }
 
   // Consume any well-formed data item without storing it (for unknown keys).
+  // The active profile still applies: skipped text is UTF-8-checked under
+  // validate_utf8, and skipped work draws on the same budgets as read work.
   void skip_value() {
     depth_guard g(*this);
+    count_item();
     item h = head();
     switch (h.major) {
       case 0: case 1: return;  // the argument is the whole item
-      case 2: case 3:
-        if (!h.indefinite()) { skip_bytes(h.value); return; }
+      case 2: case 3: {
+        auto pass = [&](std::uint64_t n) {
+          if (h.major == 3 && opts.validate_utf8) {
+            if (n > in.size() - pos) fail("truncated string", errc::truncated);
+            std::string_view sv(reinterpret_cast<const char*>(in.data() + pos),
+                                std::size_t(n));
+            if (!valid_utf8(sv))
+              fail("invalid UTF-8 in text string", errc::invalid_encoding);
+            pos += std::size_t(n);
+          } else {
+            skip_bytes(n);
+          }
+        };
+        if (!h.indefinite()) { pass(h.value); return; }
         while (!try_break()) {
           item c = raw_head();
           if (c.major != h.major || c.indefinite()) fail("bad string chunk", errc::invalid_encoding);
-          skip_bytes(c.value);
+          pass(c.value);
         }
         return;
-      case 4:
-        if (h.indefinite()) { while (!try_break()) skip_value(); return; }
+      }
+      case 4: {
+        element_budget eb(*this, h);
+        if (h.indefinite()) {
+          while (!try_break()) { eb.tick(); skip_value(); }
+          return;
+        }
         for (std::uint64_t i = 0; i < h.value; ++i) skip_value();
         return;
-      case 5:
+      }
+      case 5: {
+        element_budget eb(*this, h);
         if (h.indefinite()) {
-          while (!try_break()) { skip_value(); skip_value(); }
+          while (!try_break()) { eb.tick(); skip_value(); skip_value(); }
           return;
         }
         for (std::uint64_t i = 0; i < h.value; ++i) { skip_value(); skip_value(); }
         return;
+      }
       default:  // major 7; simple values and floats are fully in the head
-        if (h.indefinite()) fail("unexpected break", errc::invalid_encoding);
         return;
     }
   }
@@ -1866,7 +2054,16 @@ void read_struct(cbor_reader& p, T& out) {
   // no_substitutions the text spelling cannot even match — see try_read_key).
   std::unordered_set<std::string> text_keys;
   std::unordered_set<std::int64_t> int_keys;
+  cbor_reader::element_budget eb(p, h);
+  constexpr bool denies = has<deny_unknown_fields>(^^T);
+  constexpr bool allows = has<allow_unknown_fields>(^^T);
+  auto unknown = [&] {
+    if (denies || (p.opts.deny_unknown_fields && !allows))
+      p.fail("unknown field", errc::unknown_field);
+    else p.skip_value();
+  };
   auto entry = [&] {
+    eb.tick();
     auto kh = p.head();
     if (kh.major == 0 || kh.major == 1) {
       // Native integer key: COSE-style labels, matched against int_key fields.
@@ -1874,11 +2071,7 @@ void read_struct(cbor_reader& p, T& out) {
       path_guard where(p, std::to_string(label));
       if (p.opts.reject_duplicate_keys && !int_keys.insert(label).second)
         p.fail("duplicate key", errc::duplicate_field);
-      if (!try_read_int_key(p, out, label, seen.data())) {
-        if constexpr (has<deny_unknown_fields>(^^T))
-          p.fail("unknown field", errc::unknown_field);
-        else p.skip_value();
-      }
+      if (!try_read_int_key(p, out, label, seen.data())) unknown();
       return;
     }
     if (kh.major != 3) p.fail("expected a map key", errc::type_mismatch);
@@ -1886,10 +2079,8 @@ void read_struct(cbor_reader& p, T& out) {
     path_guard where(p, key);
     if (p.opts.reject_duplicate_keys && !text_keys.insert(key).second)
       p.fail("duplicate key", errc::duplicate_field);
-    if (!try_read_key(p, out, key, seen.data(), !p.opts.no_substitutions)) {
-      if constexpr (has<deny_unknown_fields>(^^T)) p.fail("unknown field", errc::unknown_field);
-      else p.skip_value();
-    }
+    if (!try_read_key(p, out, key, seen.data(), !p.opts.no_substitutions))
+      unknown();
   };
   if (h.indefinite()) { while (!p.try_break()) entry(); }
   else for (std::uint64_t i = 0; i < h.value; ++i) entry();
@@ -1898,6 +2089,7 @@ void read_struct(cbor_reader& p, T& out) {
 
 template <typename T>
 void read_value(cbor_reader& p, T& out) {
+  p.count_item();
   if constexpr (std::same_as<T, bool>) {
     auto h = p.head();
     if (h.major == 7 && h.ai == 20) out = false;
@@ -1952,7 +2144,9 @@ void read_value(cbor_reader& p, T& out) {
     auto h = p.head();
     if (h.major != 5) p.fail("expected a map", errc::type_mismatch);
     out.clear();
+    cbor_reader::element_budget eb(p, h);
     auto entry = [&] {
+      eb.tick();
       using K = typename T::key_type;
       if constexpr (string_like<K>) {
         std::string key = p.text();
@@ -1987,6 +2181,8 @@ void read_value(cbor_reader& p, T& out) {
     if (h.major == 2) {
       auto take = [&](std::uint64_t n) {
         if (n > p.in.size() - p.pos) p.fail("truncated string", errc::truncated);
+        if (n > p.opts.lim.max_string_bytes - out.size())
+          p.fail("string too long", errc::limit_exceeded);
         out.insert(out.end(), p.in.begin() + std::ptrdiff_t(p.pos),
                    p.in.begin() + std::ptrdiff_t(p.pos + n));
         p.pos += std::size_t(n);
@@ -2005,7 +2201,11 @@ void read_value(cbor_reader& p, T& out) {
       // The pre-bytes encoding (and what a JSON-converted document holds):
       // an array of small integers.
       cbor_reader::depth_guard g(p);
-      auto element = [&] { out.push_back(p.to_integer<std::uint8_t>(p.head())); };
+      cbor_reader::element_budget eb(p, h);
+      auto element = [&] {
+        eb.tick();
+        out.push_back(p.to_integer<std::uint8_t>(p.head()));
+      };
       if (h.indefinite()) { while (!p.try_break()) element(); }
       else for (std::uint64_t i = 0; i < h.value; ++i) element();
     } else {
@@ -2016,8 +2216,10 @@ void read_value(cbor_reader& p, T& out) {
     auto h = p.head();
     if (h.major != 4) p.fail("expected an array", errc::type_mismatch);
     out.clear();
+    cbor_reader::element_budget eb(p, h);
     std::size_t index = 0;
     auto element = [&] {
+      eb.tick();
       path_guard where(p, std::to_string(index++));
       read_value(p, out.emplace_back());
     };
